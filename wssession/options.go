@@ -10,7 +10,7 @@
 //   - processloop.go  processLoop:inbox → ParseRequest → connCap → Run
 //   - writeloop.go    writeLoop:outbox → WS(含 Ping 心跳)
 //   - outbound.go     outboundMessage + queue 反压
-//   - connlimit.go    IP/key 维度连接 cap(包级 sync.Map,与 middleware/conncap 不共享)
+//   - connlimit.go    IP/key 维度连接 cap(分片 mutex 计数表,归零删除 key)
 //   - origin.go       Origin 白名单
 //
 // 完整流程文档见 docs/wsmsg-flow.md。
@@ -67,6 +67,18 @@ type Options struct {
 	// ConnCapKeyMax 单 token + path 同时活跃连接数上限(ParseRequest 返回的 key)。
 	// ConnCapEnabled=true 时必须 > 0。默认 5。
 	ConnCapKeyMax int
+
+	// TrustedProxyCount 信任的反向代理跳数,决定客户端 IP 的取值来源。
+	//
+	//   - 0(默认):忽略 X-Forwarded-For,客户端 IP 取自 RemoteAddr。
+	//     X-Forwarded-For 客户端可任意伪造,默认信任会导致 IP 维度 connCap
+	//     被绕过,并放大连接计数表的 key 膨胀,故默认不信任。
+	//   - n>0:从 X-Forwarded-For 列表**由右向左**数第 n 跳取客户端 IP
+	//     (可信代理把上游地址追加在列表右侧);n 超过列表长度时回退到列表
+	//     最左端,列表为空时回退 RemoteAddr。
+	//
+	// 部署在 Nginx / 网关等反向代理后时,应设为可信代理的跳数。
+	TrustedProxyCount int
 }
 
 // Validate 校验运行所需的关键参数。

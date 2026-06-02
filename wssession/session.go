@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +36,13 @@ type Session struct {
 	// subscribed 标记是否已完成首帧 + ParseRequest + tokenCap 三步;
 	// 切到 true 后 readLoop 检测到任何业务帧立即拒。
 	subscribed atomic.Bool
+
+	// firstFrameClaimed 裁决"首帧到达"与"首帧超时"的竞态:二者各自 CAS,
+	// 只有抢到的一方能对连接采取动作,避免首帧已收到却被误判超时关闭。
+	firstFrameClaimed atomic.Bool
+
+	// errFrameOnce 保证并发错误关闭时只下发首个 error 帧。
+	errFrameOnce sync.Once
 
 	closeOnce sync.Once
 }
@@ -69,7 +77,7 @@ func Serve(parent context.Context, w http.ResponseWriter, r *http.Request, optio
 	// ① IP 维度 connCap(Upgrade 之前)
 	var ipCapKey string
 	if opts.ConnCapEnabled {
-		ipCapKey = "ip:" + clientIP(r) + ":" + path
+		ipCapKey = "ip:" + clientIP(r, opts.TrustedProxyCount) + ":" + path
 		if _, ok := tryAcquire(ipCapKey, opts.ConnCapIPMax); !ok {
 			// 普通 HTTP 响应,不进入 WS 协议层
 			w.Header().Set("Content-Type", "application/json")
@@ -164,27 +172,29 @@ func (s *Session) Close() error {
 //
 // 调用方应在调用本方法后 return,让所在的 loop 退出 → errgroup 收敛 → defer Close。
 func (s *Session) closeWithError(ctx context.Context, code int, reason string) {
-	frame := errorFrame{
-		Event:     "error",
-		Code:      code,
-		Reason:    truncateErrorReason(reason),
-		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
-	}
-	done := make(chan struct{})
-	if err := s.queueWithTimeout(ctx, outboundMessage{
-		isJSON:      true,
-		jsonPayload: frame,
-		done:        done,
-	}, errorFrameQueueOfferTimeout); err != nil {
-		// 入队失败(ctx done / slow consumer)→ 直接关
-		_ = s.Close()
-		return
-	}
-	// 同步等 writeLoop flush 完 error 帧(1s 兜底,防 writeLoop 因 ctx done 已退出)
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-	}
+	// 幂等:并发触发只下发首个 error 帧,避免客户端收到矛盾的错误码。
+	s.errFrameOnce.Do(func() {
+		frame := errorFrame{
+			Event:     "error",
+			Code:      code,
+			Reason:    truncateErrorReason(reason),
+			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		done := make(chan struct{})
+		if err := s.queueWithTimeout(ctx, outboundMessage{
+			isJSON:      true,
+			jsonPayload: frame,
+			done:        done,
+		}, errorFrameQueueOfferTimeout); err != nil {
+			// 入队失败(ctx done / slow consumer)→ 不等 flush,落到下面统一 Close
+			return
+		}
+		// 同步等 writeLoop flush 完 error 帧(1s 兜底,防 writeLoop 因 ctx done 已退出)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+	})
 	_ = s.Close()
 }
 
@@ -218,33 +228,35 @@ func IsExpectedClose(err error) bool {
 	return false
 }
 
-// clientIP 从 http.Request 提取客户端 IP(优先 X-Forwarded-For 首段,fallback RemoteAddr)。
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// 取第一段(逗号分隔列表)
-		for i := range len(xff) {
-			if xff[i] == ',' {
-				return trimSpace(xff[:i])
-			}
-		}
-		return trimSpace(xff)
+// clientIP 提取用于 IP 维度 connCap 的客户端 IP。
+//
+// trustedProxyCount<=0 时只用传输层 RemoteAddr,忽略客户端可伪造的
+// X-Forwarded-For;>0 时从 X-Forwarded-For 列表由右向左取第 trustedProxyCount
+// 跳(可信代理把上游地址追加在右侧),越界回退到列表最左端或 RemoteAddr。
+func clientIP(r *http.Request, trustedProxyCount int) string {
+	remote := remoteHost(r)
+	if trustedProxyCount <= 0 {
+		return remote
 	}
+
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return remote
+	}
+
+	parts := strings.Split(xff, ",")
+	idx := max(len(parts)-trustedProxyCount, 0)
+	if ip := strings.TrimSpace(parts[idx]); ip != "" {
+		return ip
+	}
+	return remote
+}
+
+// remoteHost 返回 RemoteAddr 的 host 部分(无端口);解析失败时原样返回。
+func remoteHost(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	return host
-}
-
-// trimSpace 是 strings.TrimSpace 的轻量替代,避免 import strings 仅为此一处。
-func trimSpace(s string) string {
-	start := 0
-	for start < len(s) && (s[start] == ' ' || s[start] == '\t') {
-		start++
-	}
-	end := len(s)
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
-		end--
-	}
-	return s[start:end]
 }

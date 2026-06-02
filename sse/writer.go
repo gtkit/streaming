@@ -1,3 +1,5 @@
+// Package sse 提供基于 gin 的 Server-Sent Events 写入器：解决 SSE 长连接被
+// http.Server.WriteTimeout 杀死的问题，并为每帧写入设置 per-write deadline。
 package sse
 
 import (
@@ -13,16 +15,19 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// Writer 是基于 gin.Context 的低层 SSE 写入器，负责设置 SSE 响应头与逐帧写入。
 type Writer struct {
 	c *gin.Context
 }
 
 const defaultWriteTimeout = 10 * time.Second
 
+// New 基于 gin.Context 创建一个 SSE Writer。
 func New(c *gin.Context) *Writer {
 	return &Writer{c: c}
 }
 
+// WriteHeaders 写入 SSE 响应头，并解除 http.Server.WriteTimeout 对本长连接的写截止。
 func (w *Writer) WriteHeaders() {
 	// SSE 是长连接：必须解除 http.Server.WriteTimeout 对本条连接的写截止时间，
 	// 否则待支付订单、LLM 长响应会在全局 WriteTimeout 到期时被服务端 RST。
@@ -41,6 +46,7 @@ func (w *Writer) WriteHeaders() {
 	w.c.Status(http.StatusOK)
 }
 
+// Event 写入一条命名 SSE 事件，payload 自动 JSON 序列化；写入带 per-write deadline。
 func (w *Writer) Event(name string, payload any) error {
 	select {
 	case <-w.c.Request.Context().Done():
@@ -106,6 +112,7 @@ func (w *Writer) Retry(milliseconds int) error {
 	})
 }
 
+// Context 返回绑定到本 SSE 连接的请求上下文。
 func (w *Writer) Context() context.Context {
 	return w.c.Request.Context()
 }

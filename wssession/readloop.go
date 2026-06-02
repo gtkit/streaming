@@ -2,6 +2,7 @@ package wssession
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -24,10 +25,12 @@ type inboundFrame struct {
 //   - **不做**业务解析(JSON parse 由 processLoop 完成)
 //
 // 这样 readLoop 在 ParseRequest / Run 内做慢操作时仍可继续读 Pong。
-func (s *Session) readLoop(ctx context.Context, cancel context.CancelFunc) error {
+func (s *Session) readLoop(ctx context.Context, cancel context.CancelFunc) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			// panic 兜底:任何 panic 通过 cancel 让所有 goroutine 收敛
+			// panic 兜底:转成 error 经 errgroup 上抛(不再静默吞没),
+			// 并 cancel 让其余 goroutine 收敛。
+			err = fmt.Errorf("wssession: panic in readLoop: %v", p)
 			cancel()
 		}
 	}()

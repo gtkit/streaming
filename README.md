@@ -158,6 +158,7 @@ func handleWSMsg(c *gin.Context) {
 			ConnCapEnabled:     true,
 			ConnCapIPMax:       50, // 单 IP+path 并发上限
 			ConnCapKeyMax:      5,  // 单 key+path 并发上限（key 来自 ParseRequest）
+			TrustedProxyCount:  1,  // 部署在 1 层可信反代后；0（默认）则忽略 X-Forwarded-For，IP 取自 RemoteAddr
 		},
 		wssession.Handlers{
 			// ParseRequest：解析首帧，返回 (限流key, 业务请求对象, err)。
@@ -221,6 +222,15 @@ func pollOrder(token string) (done bool, payload any) {
 
 错误码：`408` 首帧超时、`415` 非文本帧、`422` 解析失败、`429` 连接超限/慢消费、`500` 内部错误
 （常量见 `wssession/errors.go`：`CodeFirstFrameTimeout` / `CodeInvalidParam` / `CodeTooManyConn` 等）。
+
+### 客户端 IP 与可信代理
+
+IP 维度连接 cap 使用的客户端 IP 默认取自传输层 `RemoteAddr`，**忽略客户端可伪造的 `X-Forwarded-For`**。
+部署在反向代理（Nginx / 网关）后时，把 `Options.TrustedProxyCount` 设为可信代理跳数，
+`wssession` 会从 `X-Forwarded-For` 列表**由右向左**取第 N 跳作为客户端 IP。未配置（0）时，
+所有请求按真实 `RemoteAddr` 计入 cap，伪造 XFF 无法绕过上限。
+
+> loop goroutine 内发生 panic 会被恢复并转为 error 经 `Serve` 返回值上抛（不会让进程崩溃，也不会被静默吞没）。
 
 ### 关键约束
 

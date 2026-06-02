@@ -717,14 +717,11 @@ func TestConcurrentSessionsCounterBalances(t *testing.T) {
 	// 等服务端 cleanup
 	time.Sleep(200 * time.Millisecond)
 
-	// 此 path 上不应再有任何 active 连接
-	connCounters.Range(func(k, v any) bool {
-		key := k.(string)
-		if strings.Contains(key, path) {
-			if n := v.(*atomic.Int64).Load(); n != 0 {
-				t.Errorf("counter %s = %d, want 0", key, n)
-			}
+	// 此 path 上每个 token key 都应归零(归零即被删除,count 返回 0)。
+	for i := range N {
+		key := fmt.Sprintf("token:tok-%d:%s", i, path)
+		if n := connCounters.count(key); n != 0 {
+			t.Errorf("counter %s = %d, want 0", key, n)
 		}
-		return true
-	})
+	}
 }

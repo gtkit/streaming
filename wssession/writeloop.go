@@ -2,6 +2,7 @@ package wssession
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -16,9 +17,10 @@ import (
 //   - ctx.Done() → 自然结束
 //   - outbox 收到的帧 WriteJSON / WriteMessage 失败 → return err 让 errgroup 收敛
 //   - Ping 失败(客户端假死) → return err
-func (s *Session) writeLoop(ctx context.Context, cancel context.CancelFunc) error {
+func (s *Session) writeLoop(ctx context.Context, cancel context.CancelFunc) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
+			err = fmt.Errorf("wssession: panic in writeLoop: %v", p)
 			cancel()
 		}
 	}()

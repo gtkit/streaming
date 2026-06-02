@@ -31,9 +31,10 @@ const (
 	CodeInternal          = 500
 )
 
-const (
-	maxErrorReasonLen = 256
+const maxErrorReasonLen = 256
 
+// ReasonFirstFrameTimeout 等是下发给客户端 error 帧的标准 reason 文案（对外契约）。
+const (
 	ReasonFirstFrameTimeout      = "first frame timeout"
 	ReasonBinaryFrameUnsupported = "binary frame not supported"
 	ReasonUnexpectedFrame        = "unexpected frame after subscribed"

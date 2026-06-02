@@ -3,7 +3,6 @@ package wssession
 import (
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 )
 
@@ -37,11 +36,9 @@ func TestTryAcquire_Bounds(t *testing.T) {
 		t.Fatalf("acq#3: cur=%d, want 3 (max+1 pre-rollback)", cur)
 	}
 
-	// 验证拒之后计数已回滚,实际仍是 2
-	if v, _ := connCounters.Load(key); v != nil {
-		if n := v.(*atomic.Int64).Load(); n != 2 {
-			t.Fatalf("after rejected acq: counter=%d, want 2 (rollback worked)", n)
-		}
+	// 验证拒之后计数未净增,实际仍是 2
+	if n := connCounters.count(key); n != 2 {
+		t.Fatalf("after rejected acq: counter=%d, want 2 (failed attempt did not net-increase)", n)
 	}
 
 	// cleanup
@@ -102,9 +99,7 @@ func TestTryAcquire_ConcurrentEnterLeaveBalances(t *testing.T) {
 	}
 	wg.Wait()
 
-	if v, _ := connCounters.Load(key); v != nil {
-		if n := v.(*atomic.Int64).Load(); n != 0 {
-			t.Fatalf("after %d concurrent enter/leave: counter=%d, want 0 (no leak)", N, n)
-		}
+	if n := connCounters.count(key); n != 0 {
+		t.Fatalf("after %d concurrent enter/leave: counter=%d, want 0 (no leak)", N, n)
 	}
 }

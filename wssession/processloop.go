@@ -3,6 +3,7 @@ package wssession
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -22,16 +23,20 @@ import (
 //   - Run 自身是 blocking 业务循环(snapshot / poll / push),不是消息回调
 //   - readLoop 已经独立 goroutine,不被 Run 阻塞
 //   - 单 Session 内不需要并发处理多条 inbound 帧(协议约定"一连接一订阅")
-func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) error {
+func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
+			err = fmt.Errorf("wssession: panic in processLoop: %v", p)
 			cancel()
 		}
 	}()
 
-	// ① 首帧超时 timer:到时主动 close
+	// ① 首帧超时 timer:到时**抢占** claim,成功才下发 408 + close。
+	// 与下面"首帧到达"路径用同一个 firstFrameClaimed CAS 互斥,避免竞态。
 	firstFrameTimer := time.AfterFunc(s.options.FirstFrameTimeout, func() {
-		s.closeWithError(ctx, CodeFirstFrameTimeout, ReasonFirstFrameTimeout)
+		if s.firstFrameClaimed.CompareAndSwap(false, true) {
+			s.closeWithError(ctx, CodeFirstFrameTimeout, ReasonFirstFrameTimeout)
+		}
 	})
 
 	// ② 等首帧
@@ -42,6 +47,10 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) er
 		return ctx.Err()
 	case firstFrame = <-s.inbox:
 		firstFrameTimer.Stop()
+		// 抢占 claim:抢不到说明超时回调已先动连接,直接退出。
+		if !s.firstFrameClaimed.CompareAndSwap(false, true) {
+			return ErrFirstFrameTimeout
+		}
 	}
 
 	// ③ Handlers.ParseRequest

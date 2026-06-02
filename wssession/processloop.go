@@ -27,6 +27,7 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (e
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("wssession: panic in processLoop: %v", p)
+			s.options.emit(ctx, Event{Type: EventPanic, Reason: "panic in processLoop", Err: err})
 			cancel()
 		}
 	}()
@@ -66,6 +67,7 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (e
 		tokenCapKey = "token:" + key + ":" + s.path
 		_, ok := tryAcquire(tokenCapKey, s.options.ConnCapKeyMax)
 		if !ok {
+			s.options.emit(ctx, Event{Type: EventCapRejected, Reason: ReasonTooManyTokenConn, Key: tokenCapKey})
 			s.closeWithError(ctx, CodeTooManyConn, ReasonTooManyTokenConn)
 			return errors.New("wssession: token connCap exceeded")
 		}
@@ -97,6 +99,7 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (e
 		// 正常结束:走 closeNormal 路径(由 Session.Serve 的 cleanup 处理)
 		return nil
 	case errors.Is(runErr, ErrSlowConsumer):
+		s.options.emit(ctx, Event{Type: EventSlowConsumer, Reason: ReasonSlowConsumer, Err: runErr})
 		s.closeWithError(ctx, CodeTooManyConn, ReasonSlowConsumer)
 		return runErr
 	case errors.Is(runErr, context.Canceled), errors.Is(runErr, context.DeadlineExceeded):

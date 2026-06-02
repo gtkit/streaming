@@ -31,6 +31,7 @@ func (s *Session) readLoop(ctx context.Context, cancel context.CancelFunc) (err 
 			// panic 兜底:转成 error 经 errgroup 上抛(不再静默吞没),
 			// 并 cancel 让其余 goroutine 收敛。
 			err = fmt.Errorf("wssession: panic in readLoop: %v", p)
+			s.options.emit(ctx, Event{Type: EventPanic, Reason: "panic in readLoop", Err: err})
 			cancel()
 		}
 	}()

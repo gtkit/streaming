@@ -56,15 +56,36 @@ func newOriginChecker(allowedOrigins []string) func(r *http.Request) bool {
 }
 
 // sameOrigin 比较 Origin URL 的 host 部分与请求 Host header 是否一致。
-// 例:Origin=https://example.com:443,Host=example.com:443 → true.
+//
+// 会归一化默认端口:浏览器对 https 省略 443、http 省略 80,故按 Origin 的
+// scheme 给缺省端口的一端补全默认端口再比较。
+// 例:Origin=https://example.com(无端口),Host=example.com:443 → true。
 func sameOrigin(origin, host string) bool {
-	// Origin 形如 scheme://host[:port],提取 host 部分
+	scheme := ""
+	// Origin 形如 scheme://host[:port],提取 scheme 与 host 部分
 	if i := strings.Index(origin, "://"); i >= 0 {
+		scheme = strings.ToLower(origin[:i])
 		origin = origin[i+3:]
 	}
 	// 去掉路径
 	if i := strings.IndexByte(origin, '/'); i >= 0 {
 		origin = origin[:i]
 	}
-	return strings.EqualFold(origin, host)
+	return strings.EqualFold(normalizeHostPort(origin, scheme), normalizeHostPort(host, scheme))
+}
+
+// normalizeHostPort 给不含端口的 host 补上 scheme 默认端口(https/wss→443,http/ws→80)。
+// 含 ':' 的(已带端口或 IPv6 字面量)原样返回,避免破坏 IPv6 地址。
+func normalizeHostPort(hostport, scheme string) string {
+	if strings.Contains(hostport, ":") {
+		return hostport
+	}
+	switch scheme {
+	case "https", "wss":
+		return hostport + ":443"
+	case "http", "ws":
+		return hostport + ":80"
+	default:
+		return hostport
+	}
 }

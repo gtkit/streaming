@@ -21,6 +21,7 @@ func (s *Session) writeLoop(ctx context.Context, cancel context.CancelFunc) (err
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("wssession: panic in writeLoop: %v", p)
+			s.options.emit(ctx, Event{Type: EventPanic, Reason: "panic in writeLoop", Err: err})
 			cancel()
 		}
 	}()

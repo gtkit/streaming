@@ -1,6 +1,9 @@
 package wssession
 
-import "sync"
+import (
+	"maps"
+	"sync"
+)
 
 // keyedCounter 是按 key 计数的活跃连接表,计数归零时**删除 key 条目**,
 // 保证长期运行时占用与当前活跃 key 数成正比,而非历史出现过的 key 总数。
@@ -82,6 +85,18 @@ func (kc *keyedCounter) count(key string) int64 {
 	return s.counts[key]
 }
 
+// snapshot 返回所有活跃 key 及其计数的独立副本。
+func (kc *keyedCounter) snapshot() map[string]int64 {
+	out := make(map[string]int64)
+	for i := range kc.shards {
+		s := &kc.shards[i]
+		s.mu.Lock()
+		maps.Copy(out, s.counts)
+		s.mu.Unlock()
+	}
+	return out
+}
+
 // connCounters 是 wssession 包级独立的连接计数器注册表。
 //
 // 与其它子系统(如 SSE 路径)的 connCap **不共享**——保证各路径连接 cap 隔离。
@@ -99,4 +114,14 @@ func tryAcquire(key string, maxConcurrent int) (current int64, ok bool) {
 // release 原子自减 key 对应的活跃连接计数(见 keyedCounter.release)。
 func release(key string) {
 	connCounters.release(key)
+}
+
+// ConnCapSnapshot 返回调用时刻所有活跃 cap key 及其连接数的快照。
+//
+// 返回值是独立副本,调用方可自由读取/修改而不影响内部计数;
+// 已归零删除的 key 不会出现。供 metrics / 运维查询使用。
+//
+// key 形态:"ip:<client_ip>:<path>" / "token:<key>:<path>"。
+func ConnCapSnapshot() map[string]int64 {
+	return connCounters.snapshot()
 }

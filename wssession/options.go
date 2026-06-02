@@ -17,9 +17,54 @@
 package wssession
 
 import (
+	"context"
 	"errors"
 	"time"
 )
+
+// EventType 标识 wssession 在连接生命周期内上报的事件类别。
+type EventType int
+
+const (
+	// EventPanic 某 loop goroutine 发生 panic(已被 recover 并转为 error)。
+	EventPanic EventType = iota + 1
+	// EventSlowConsumer 出站队列满 + QueueOfferTimeout 超时,客户端消费跟不上。
+	EventSlowConsumer
+	// EventCapRejected 连接被 IP 或 token 维度连接 cap 拒绝。
+	EventCapRejected
+	// EventAbnormalClose 连接以 1006(无正常 close 握手)异常断开。
+	EventAbnormalClose
+)
+
+// String 返回事件类型的可读名,便于日志。
+func (t EventType) String() string {
+	switch t {
+	case EventPanic:
+		return "panic"
+	case EventSlowConsumer:
+		return "slow_consumer"
+	case EventCapRejected:
+		return "cap_rejected"
+	case EventAbnormalClose:
+		return "abnormal_close"
+	default:
+		return "unknown"
+	}
+}
+
+// Event 是 wssession 通过 Options.OnEvent 上报给调用方的生命周期事件。
+//
+// 字段语义:
+//   - Type   事件类别
+//   - Reason 人类可读原因文案
+//   - Err    关联错误(可能为 nil)
+//   - Key    cap 相关事件的 cap key(如 "ip:...:path" / "token:...:path"),其它事件为空
+type Event struct {
+	Type   EventType
+	Reason string
+	Err    error
+	Key    string
+}
 
 // Options 控制 wssession Session 的所有可调行为。
 //
@@ -79,6 +124,25 @@ type Options struct {
 	//
 	// 部署在 Nginx / 网关等反向代理后时,应设为可信代理的跳数。
 	TrustedProxyCount int
+
+	// OnEvent 可选的生命周期事件回调,用于接入调用方自己的日志 / metrics。
+	//
+	// 上报时机:panic / 慢消费者 / 连接 cap 拒绝 / 1006 异常断开(见 EventType)。
+	// nil 时桥接层跳过上报。本包不绑定日志栈,事件记录方式由调用方决定。
+	//
+	// 回调必须**快且非阻塞**(同步调用,会短暂参与连接收敛路径);回调内的 panic
+	// 会被桥接层 recover,不影响连接生命周期。
+	OnEvent func(ctx context.Context, ev Event)
+}
+
+// emit 安全触发 OnEvent:nil 跳过,并 recover 用户回调内的 panic
+// (回调 panic 不应影响连接收敛,也不再触发 EventPanic 递归)。
+func (o Options) emit(ctx context.Context, ev Event) {
+	if o.OnEvent == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	o.OnEvent(ctx, ev)
 }
 
 // Validate 校验运行所需的关键参数。

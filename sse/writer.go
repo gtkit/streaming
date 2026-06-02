@@ -16,6 +16,10 @@ import (
 )
 
 // Writer 是基于 gin.Context 的低层 SSE 写入器，负责设置 SSE 响应头与逐帧写入。
+//
+// 并发安全：Writer **非并发安全**——它直接写底层 gin.ResponseWriter，
+// 不做任何串行化。若需从多个 goroutine（如心跳 + 业务推送）写入同一连接，
+// 请改用 Stream（它用互斥锁串行化所有写方法）。
 type Writer struct {
 	c *gin.Context
 }

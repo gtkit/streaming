@@ -79,6 +79,7 @@ func Serve(parent context.Context, w http.ResponseWriter, r *http.Request, optio
 	if opts.ConnCapEnabled {
 		ipCapKey = "ip:" + clientIP(r, opts.TrustedProxyCount) + ":" + path
 		if _, ok := tryAcquire(ipCapKey, opts.ConnCapIPMax); !ok {
+			opts.emit(parent, Event{Type: EventCapRejected, Reason: ReasonTooManyIPConn, Key: ipCapKey})
 			// 普通 HTTP 响应,不进入 WS 协议层
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -139,9 +140,18 @@ func Serve(parent context.Context, w http.ResponseWriter, r *http.Request, optio
 
 	// ⑥ 等所有 goroutine 收敛
 	waitErr := group.Wait()
+	if waitErr == nil {
+		return nil
+	}
 
-	// 过滤预期 close 错误
-	if waitErr != nil && !IsExpectedClose(waitErr) {
+	// 1006 异常断开:上报事件,但不作为错误返回(避免网络抖动变成误报)
+	if isAbnormalClose(waitErr) {
+		opts.emit(ctx, Event{Type: EventAbnormalClose, Reason: "abnormal closure", Err: waitErr})
+		return nil
+	}
+
+	// 过滤其余预期 close 错误
+	if !IsExpectedClose(waitErr) {
 		return waitErr
 	}
 	return nil
@@ -221,11 +231,19 @@ func IsExpectedClose(err error) bool {
 		websocket.CloseNormalClosure,
 		websocket.CloseGoingAway,
 		websocket.CloseNoStatusReceived,
-		websocket.CloseAbnormalClosure,
 	) {
 		return true
 	}
 	return false
+}
+
+// isAbnormalClose 识别 1006(CloseAbnormalClosure):无正常 close 握手的断开。
+//
+// 1006 不再归为预期 close(见 IsExpectedClose):它可能是客户端网络抖动,
+// 也可能掩盖服务端写超时等真实问题,故单独识别并通过 OnEvent 上报,
+// 但不作为 Serve 错误返回(避免把常见网络抖动变成调用方的错误误报)。
+func isAbnormalClose(err error) bool {
+	return websocket.IsCloseError(err, websocket.CloseAbnormalClosure)
 }
 
 // clientIP 提取用于 IP 维度 connCap 的客户端 IP。

@@ -309,64 +309,9 @@ type subscribeReq struct {
 	Token string `json:"token"`
 }
 
+// handleWSMsg 只负责接线：把 Options 与 Handlers 交给 Serve，再处理返回值。
 func handleWSMsg(c *gin.Context) {
-	err := wssession.Serve(
-		c.Request.Context(), // parent context
-		c.Writer,            // http.ResponseWriter
-		c.Request,           // *http.Request（用于 Upgrade / Origin 校验）
-		wssession.Options{
-			AllowedOrigins:     []string{"https://example.com"}, // 空切片 = same-origin
-			MaxSessionDuration: 30 * time.Minute,
-			PingInterval:       25 * time.Second,
-			FirstFrameTimeout:  10 * time.Second,
-			ConnCapEnabled:     true,
-			ConnCapIPMax:       50, // 单 IP+path 并发上限
-			ConnCapKeyMax:      5,  // 单 key+path 并发上限（key 来自 ParseRequest）
-			TrustedProxyCount:  1,  // 部署在 1 层可信反代后；0（默认）则忽略 X-Forwarded-For，IP 取自 RemoteAddr
-			// OnEvent 可选：接入自己的日志/metrics（本包不绑定日志栈）
-			OnEvent: func(ctx context.Context, ev wssession.Event) {
-				// 例：logger.Warn("ws event", zap.Stringer("type", ev.Type), zap.Error(ev.Err))
-				_ = ev
-			},
-		},
-		wssession.Handlers{
-			// ParseRequest：解析首帧，返回 (限流key, 业务请求对象, err)。
-			// 必须快（只做解析 + 字段校验，不查 DB / 不发网络）。
-			ParseRequest: func(ctx context.Context, raw []byte) (key string, req any, err error) {
-				var r subscribeReq
-				if err := json.Unmarshal(raw, &r); err != nil {
-					return "", nil, err // → 下发 error(422) 帧并 close
-				}
-				if r.Token == "" {
-					return "", nil, errors.New("token required")
-				}
-				// 返回的 key 用于 token 维度连接 cap；返回的 req 原样传给 Run
-				return r.Token, r, nil
-			},
-			// Run：业务推送循环，blocking 调用。通过 sink.Push 推帧；return 即结束连接。
-			Run: func(ctx context.Context, req any, sink wssession.PushSink) error {
-				r := req.(subscribeReq)
-				poll := time.NewTicker(3 * time.Second)
-				defer poll.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return ctx.Err() // 客户端断开 / 30min 超时（预期 close）
-					case <-poll.C:
-						done, payload := pollOrder(r.Token)
-						if err := sink.Push(ctx, payload); err != nil {
-							return err // ErrSlowConsumer → 下发 error(429) + close
-						}
-						if done {
-							return nil // 正常结束 → normal closure
-						}
-					}
-				}
-			},
-			// OnConnect 可选：Upgrade 成功后、进 Run 前调一次（连接级 setup / 审计）。
-			// OnConnect: func(ctx context.Context, sess *wssession.Session) error { return nil },
-		},
-	)
+	err := wssession.Serve(c.Request.Context(), c.Writer, c.Request, wsOptions(), wsHandlers())
 
 	// Serve 已过滤客户端正常断开等预期 close（见 wssession.IsExpectedClose）；
 	// 返回 non-nil 即真异常，由调用方决定记录方式（本包不打日志）。
@@ -374,6 +319,72 @@ func handleWSMsg(c *gin.Context) {
 		// 例如：logger.Warn("wsmsg serve failed", zap.Error(err))
 		_ = err
 	}
+}
+
+// wsOptions 集中配置：心跳 / 超时 / 连接 cap / Origin / 事件回调。
+func wsOptions() wssession.Options {
+	return wssession.Options{
+		AllowedOrigins:     []string{"https://example.com"}, // 空切片 = same-origin
+		MaxSessionDuration: 30 * time.Minute,
+		PingInterval:       25 * time.Second,
+		FirstFrameTimeout:  10 * time.Second,
+		ConnCapEnabled:     true,
+		ConnCapIPMax:       50, // 单 IP+path 并发上限
+		ConnCapKeyMax:      5,  // 单 key+path 并发上限（key 来自 ParseRequest）
+		TrustedProxyCount:  1,  // 部署在 1 层可信反代后；0（默认）则忽略 X-Forwarded-For，IP 取自 RemoteAddr
+		OnEvent:            onWSEvent,
+	}
+}
+
+// wsHandlers 注入业务逻辑。Handlers 是函数式注入，可直接传具名函数，无需匿名闭包。
+func wsHandlers() wssession.Handlers {
+	return wssession.Handlers{
+		ParseRequest: parseSubscribe,
+		Run:          runPush,
+		// OnConnect 可选：Upgrade 成功后、进 Run 前调一次（连接级 setup / 审计）。
+		// OnConnect: onConnect,
+	}
+}
+
+// parseSubscribe 解析首帧，返回 (限流 key, 业务请求对象, err)。
+// 必须快：只做解析 + 字段校验，不查 DB / 不发网络。
+func parseSubscribe(_ context.Context, raw []byte) (key string, req any, err error) {
+	var r subscribeReq
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return "", nil, err // → 下发 error(422) 帧并 close
+	}
+	if r.Token == "" {
+		return "", nil, errors.New("token required")
+	}
+	// 返回的 key 用于 token 维度连接 cap；返回的 req 原样传给 Run
+	return r.Token, r, nil
+}
+
+// runPush 业务推送循环，blocking 调用。通过 sink.Push 推帧；return 即结束连接。
+func runPush(ctx context.Context, req any, sink wssession.PushSink) error {
+	r := req.(subscribeReq)
+	poll := time.NewTicker(3 * time.Second)
+	defer poll.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err() // 客户端断开 / 30min 超时（预期 close）
+		case <-poll.C:
+			done, payload := pollOrder(r.Token)
+			if err := sink.Push(ctx, payload); err != nil {
+				return err // ErrSlowConsumer → 下发 error(429) + close
+			}
+			if done {
+				return nil // 正常结束 → normal closure
+			}
+		}
+	}
+}
+
+// onWSEvent 接入自己的日志 / metrics（本包不绑定日志栈）。
+func onWSEvent(_ context.Context, ev wssession.Event) {
+	// 例：logger.Warn("ws event", zap.Stringer("type", ev.Type), zap.Error(ev.Err))
+	_ = ev
 }
 
 func pollOrder(token string) (done bool, payload any) {
@@ -493,6 +504,97 @@ func loadUserUpdates(userID string) (done bool, payload any) {
 > **配套保护**：`FirstFrameTimeout`（默认 10s）兜底"连上不发鉴权帧"的连接；`ConnCapKeyMax` 以 token 为 key 限制单用户并发连接数；token 走首帧 body 而非 URL query，不会泄漏进 access log。
 >
 > **握手前鉴权**：若用 cookie / `Authorization` 等 HTTP 凭据，应在调 `Serve` 之前的中间件里验，鉴权失败直接返回 401、根本不 Upgrade；把结果塞进 `c.Request.Context()`，`ParseRequest` / `Run` 都能取到。
+
+### 双向多轮对话（LLM 流式）
+
+默认 wssession 是"订阅后只收不发"的单向模型。要在**单个连接里多轮双向对话**（用户反复发消息、AI 流式回复、可被新消息打断），提供 `Handlers.OnMessage` 即进入**双向模式**：首帧仍由 `ParseRequest` 处理（会话初始化 / 鉴权），其后每条客户端消息触发一轮 `OnMessage`，在独立 goroutine 运行；**新消息到达会 cancel 上一轮的 `turnCtx`（打断正在进行的生成）**，同一连接同时至多一个活跃轮次。
+
+> 双向模式下 `OnMessage` **必须监听 `turnCtx` 并及时返回**（把它传给 LLM 流式调用），否则打断无效、连接关闭时会等待其退出——与 `ParseRequest`"必须快"同性质。
+
+服务端：
+
+```go
+package main
+
+import (
+	"context"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gtkit/streaming/wssession"
+)
+
+func main() {
+	r := gin.New()
+	r.GET("/chat", handleChat)
+	_ = r.Run(":8080")
+}
+
+func handleChat(c *gin.Context) {
+	_ = wssession.Serve(c.Request.Context(), c.Writer, c.Request,
+		wssession.Options{
+			FirstFrameTimeout:    10 * time.Second,
+			InboundRatePerSecond: 2, // 单连接每秒最多 2 条用户消息（防刷）
+			InboundRateBurst:     3,
+		},
+		wssession.Handlers{
+			// 首帧：会话初始化 / 鉴权（不是对话消息）
+			ParseRequest: func(_ context.Context, raw []byte) (key string, req any, err error) {
+				return "session-1", nil, nil // 占位：解析鉴权 / 会话 ID
+			},
+			// 每条用户消息触发一轮；新消息会打断上一轮（turnCtx 被 cancel）
+			OnMessage: func(ctx context.Context, raw []byte, sink wssession.PushSink) error {
+				prompt := string(raw)
+				for token := range llmStream(ctx, prompt) { // 把 ctx 传给 LLM，支持打断
+					if err := sink.Push(ctx, gin.H{"event": "token", "text": token}); err != nil {
+						return err // ErrSlowConsumer / ctx 取消
+					}
+				}
+				return sink.Push(ctx, gin.H{"event": "done"})
+			},
+		},
+	)
+}
+
+// llmStream 占位：真实实现调 LLM 流式 API，并在 ctx 取消时停止生成。
+func llmStream(ctx context.Context, prompt string) <-chan string {
+	ch := make(chan string)
+	go func() {
+		defer close(ch)
+		for _, tok := range []string{"Hello", ", ", "world"} {
+			select {
+			case <-ctx.Done():
+				return // 被新消息打断 / 连接断开
+			case ch <- tok:
+			}
+		}
+	}()
+	return ch
+}
+```
+
+浏览器客户端（多轮收发）：
+
+```js
+const ws = new WebSocket("wss://example.com/chat");
+ws.onopen = () => ws.send(JSON.stringify({ token: "abc" })); // 首帧：会话初始化
+
+let current = "";
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+  switch (msg.event) {
+    case "subscribed": sendPrompt("你好"); break; // 订阅确认后开始第一轮
+    case "token":      current += msg.text; break; // 累积流式 token
+    case "done":       console.log("本轮完成:", current); current = ""; break;
+    case "error":      console.error(msg.code, msg.reason); break; // 含 429 限速
+  }
+};
+
+// 每条用户消息触发一轮；途中再发会打断上一轮生成
+function sendPrompt(text) { ws.send(text); }
+```
+
+> **与单向模式的关系**：`OnMessage` 为 nil 时行为完全不变（订阅后再发帧仍被拒）。双向模式下 `Run` 可选——若同时提供，作为后台主动推送循环与 `OnMessage` 并存。超过 `InboundRatePerSecond` 的消息会被丢弃并下发 `error(429)`（不关连接），同时通过 `OnEvent` 上报 `EventRateLimited`；打断会上报 `EventTurnInterrupted`。
 
 ### 帧协议（对外 JSON schema）
 

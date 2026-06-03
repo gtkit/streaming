@@ -62,8 +62,9 @@ func (s *Session) readLoop(ctx context.Context, cancel context.CancelFunc) (err 
 			return ErrInvalidFrame
 		}
 
-		// 状态机检查:已订阅后收到任何业务帧 = 协议违规,服务端 close 连接。
-		if s.subscribed.Load() {
+		// 单向模式:已订阅后收到任何业务帧 = 协议违规,服务端 close 连接。
+		// 双向模式(OnMessage 非 nil):订阅后继续把帧投 inbox,由 processLoop 逐条触发 OnMessage。
+		if s.subscribed.Load() && s.handlers.OnMessage == nil {
 			s.closeWithError(ctx, CodeInvalidParam, ReasonUnexpectedFrame)
 			return ErrUnexpectedFrame
 		}

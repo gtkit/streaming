@@ -3,11 +3,13 @@
 // 文件分布:
 //   - options.go      配置与默认值
 //   - errors.go       sentinel error + error/subscribed 帧 schema
-//   - handlers.go     业务注入函数式 hooks(OnConnect / ParseRequest / Run)
+//   - handlers.go     业务注入函数式 hooks(OnConnect / ParseRequest / Run / OnMessage)
 //   - pushsink.go     PushSink 接口:业务 → outbox 唯一入口
 //   - session.go      Session struct + Serve(lifecycle 编排) + close 路径
 //   - readloop.go     readLoop:WS → inbox
-//   - processloop.go  processLoop:inbox → ParseRequest → connCap → Run
+//   - processloop.go  processLoop:inbox → ParseRequest → connCap → Run / 双向调度
+//   - duplex.go       双向模式消息调度循环(OnMessage 逐条触发 + 打断 + 限速)
+//   - ratelimit.go    入站消息令牌桶限速器
 //   - writeloop.go    writeLoop:outbox → WS(含 Ping 心跳)
 //   - outbound.go     outboundMessage + queue 反压
 //   - connlimit.go    IP/key 维度连接 cap(分片 mutex 计数表,归零删除 key)
@@ -19,6 +21,7 @@ package wssession
 import (
 	"context"
 	"errors"
+	"math"
 	"time"
 )
 
@@ -34,6 +37,10 @@ const (
 	EventCapRejected
 	// EventAbnormalClose 连接以 1006(无正常 close 握手)异常断开。
 	EventAbnormalClose
+	// EventRateLimited 双向模式下入站消息超过速率限制,被丢弃。
+	EventRateLimited
+	// EventTurnInterrupted 双向模式下上一轮 OnMessage 因新消息到达被打断。
+	EventTurnInterrupted
 )
 
 // String 返回事件类型的可读名,便于日志。
@@ -47,6 +54,10 @@ func (t EventType) String() string {
 		return "cap_rejected"
 	case EventAbnormalClose:
 		return "abnormal_close"
+	case EventRateLimited:
+		return "rate_limited"
+	case EventTurnInterrupted:
+		return "turn_interrupted"
 	default:
 		return "unknown"
 	}
@@ -125,6 +136,14 @@ type Options struct {
 	// 部署在 Nginx / 网关等反向代理后时,应设为可信代理的跳数。
 	TrustedProxyCount int
 
+	// InboundRatePerSecond 双向模式下单连接入站业务消息的速率上限(条/秒)。
+	// 0(默认)= 不限速。仅在 Handlers.OnMessage 非 nil 时生效。
+	InboundRatePerSecond float64
+
+	// InboundRateBurst 双向模式下入站消息的突发额度(令牌桶容量)。
+	// <=0 时回退为 max(1, ceil(InboundRatePerSecond))。仅在限速启用时生效。
+	InboundRateBurst int
+
 	// OnEvent 可选的生命周期事件回调,用于接入调用方自己的日志 / metrics。
 	//
 	// 上报时机:panic / 慢消费者 / 连接 cap 拒绝 / 1006 异常断开(见 EventType)。
@@ -188,6 +207,11 @@ func normalizeOptions(o Options) Options {
 	}
 	if o.InboundBufferSize <= 0 {
 		o.InboundBufferSize = 4
+	}
+	if o.InboundRatePerSecond > 0 && o.InboundRateBurst <= 0 {
+		// burst 至少 1,且不小于每秒速率(向上取整)
+		burst := int(math.Ceil(o.InboundRatePerSecond))
+		o.InboundRateBurst = max(burst, 1)
 	}
 	return o
 }

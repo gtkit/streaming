@@ -14,6 +14,9 @@
 - `wssession` 新增 `Options.OnEvent` 可选回调与 `Event` / `EventType`：上报 panic、慢消费者、连接 cap 拒绝、1006 异常断开事件，供调用方接入自己的日志 / metrics
 - `wssession` 新增 `ConnCapSnapshot() map[string]int64`：返回当前所有活跃连接 cap key 及连接数的快照，供 metrics / 运维查询
 - `sse` 明确并发契约：`Stream` 并发安全（互斥锁串行化），`Writer` 非并发安全（多 goroutine 写请用 `Stream`）
+- `wssession` 新增双向模式：`Handlers.OnMessage` 非 nil 时，单连接支持多轮双向消息（如多轮 LLM 对话）——每条客户端消息触发一轮，**新消息打断上一轮**（每轮一个可 cancel 的 turn context），同时至多一个活跃轮次；`Run` 在双向模式下变为可选（后台主动推送）。`OnMessage` 为 nil 时单向行为完全不变
+- `wssession` 新增 `Options.InboundRatePerSecond` / `InboundRateBurst`：双向模式下单连接入站消息速率限制（令牌桶，标准库实现），超限丢弃并下发 `error(429)`，不关连接
+- `wssession` 新增 `EventType` 值 `EventRateLimited`（入站超速）与 `EventTurnInterrupted`（轮次被打断），经 `OnEvent` 上报
 
 ### Changed
 

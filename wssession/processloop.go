@@ -16,13 +16,13 @@ import (
 //	③ Handlers.ParseRequest → (key, req, err) → 失败下发 error(422) + close
 //	④ tokenCap.tryAcquire(key)            → 满下发 error(429) + close
 //	⑤ subscribed.Store(true) + 下发 subscribed 帧
-//	⑥ Handlers.Run(ctx, req, sink) 同步调用
-//	⑦ Run 返回值分发:nil → 正常关闭;ErrSlowConsumer → error(429);其他 → error(500)
+//	⑥ 单向模式(OnMessage 为 nil):Handlers.Run 同步调用 + 返回值分发
+//	   双向模式(OnMessage 非 nil):进入 duplexLoop 逐条处理后续消息(详见 duplex.go)
 //
-// Run 在本 goroutine 内**同步**调用——这是有意为之:
+// 单向模式下 Run 在本 goroutine 内**同步**调用——这是有意为之:
 //   - Run 自身是 blocking 业务循环(snapshot / poll / push),不是消息回调
 //   - readLoop 已经独立 goroutine,不被 Run 阻塞
-//   - 单 Session 内不需要并发处理多条 inbound 帧(协议约定"一连接一订阅")
+//   - 单 Session 内不需要并发处理多条 inbound 帧(单向协议约定"一连接一订阅")
 func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
@@ -89,11 +89,22 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (e
 		return err
 	}
 
-	// ⑥ Handlers.Run — 同步 blocking 业务循环
 	sink := &pushSink{sess: s}
-	runErr := s.handlers.Run(ctx, req, sink)
 
+	// ⑥ 双向模式(OnMessage 非 nil):进入消息调度循环(Run 若提供则后台并行)
+	if s.handlers.OnMessage != nil {
+		return s.duplexLoop(ctx, cancel, req, sink)
+	}
+
+	// ⑥ 单向模式:Handlers.Run 同步 blocking 业务循环
 	// ⑦ Run 返回值分发
+	return s.dispatchRunError(ctx, s.handlers.Run(ctx, req, sink))
+}
+
+// dispatchRunError 把(单向 Run / 双向后台 Run / 一轮 OnMessage)的返回值
+// 映射到连接级 close 行为:nil 保持;ErrSlowConsumer→429+close;
+// ctx 取消(预期)静默;其它→500+close。
+func (s *Session) dispatchRunError(ctx context.Context, runErr error) error {
 	switch {
 	case runErr == nil:
 		// 正常结束:走 closeNormal 路径(由 Session.Serve 的 cleanup 处理)
@@ -103,10 +114,10 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (e
 		s.closeWithError(ctx, CodeTooManyConn, ReasonSlowConsumer)
 		return runErr
 	case errors.Is(runErr, context.Canceled), errors.Is(runErr, context.DeadlineExceeded):
-		// ctx 取消是预期路径(客户端断 / 30 分钟超时),不下发 error 帧
+		// ctx 取消是预期路径(客户端断 / 30 分钟超时 / turn 被打断),不下发 error 帧
 		return runErr
 	default:
-		// 未预期的业务循环错误统一按内部错误处理,客户端只收到稳定 reason。
+		// 未预期的业务错误统一按内部错误处理,客户端只收到稳定 reason。
 		// 错误通过 Serve 返回值上抛给调用方,由调用方决定是否记录日志(本包不绑定日志栈)。
 		s.closeWithError(ctx, CodeInternal, ReasonInternalError)
 		return runErr

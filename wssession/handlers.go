@@ -35,13 +35,33 @@ type Handlers struct {
 	// Run 是 blocking 调用,跑在 processLoop 内;不要在 Run 内 spawn goroutine 后立即 return,
 	// 否则桥接层会以为业务已结束。如需异步处理,在 Run 内自己用 errgroup 编排再 return。
 	//
-	// 必填。
+	// 单向模式(OnMessage 为 nil)下必填;双向模式(OnMessage 非 nil)下可选——
+	// 若提供,作为后台主动推送循环与 OnMessage 并存。
 	Run func(ctx context.Context, req any, sink PushSink) error
+
+	// OnMessage 可选;非 nil 时启用**双向模式**。
+	//
+	// 双向模式下,首帧仍由 ParseRequest 处理(订阅/鉴权);此后客户端发送的每条业务帧
+	// 都触发一次 OnMessage(turnCtx, raw, sink),在独立 goroutine 中运行,不阻塞读循环。
+	// 新消息到达会 cancel 上一轮的 turnCtx(打断正在进行的生成),同一连接同时至多一个活跃轮次。
+	//
+	// turnCtx 在以下情况被取消:被新消息打断 / 会话超时 / 客户端断开。
+	// OnMessage 实现**必须监听 turnCtx 并及时返回**(如把它传给 LLM 流式调用),
+	// 否则打断无效、连接关闭时会等待其退出。这与 ParseRequest 的"必须快"同性质。
+	//
+	// 返回值处置:nil → 该轮正常结束,连接保持;ErrSlowConsumer → error(429)+close;
+	// ctx.Canceled/DeadlineExceeded(被打断/超时)→ 静默;其它 err → error(500)+close。
+	OnMessage func(ctx context.Context, raw []byte, sink PushSink) error
 }
 
 // validate 检查 Handlers 关键字段非 nil。
+//
+// ParseRequest 必填;Run 与 OnMessage 至少提供一个(单向至少 Run,双向至少 OnMessage)。
 func (h Handlers) validate() error {
-	if h.ParseRequest == nil || h.Run == nil {
+	if h.ParseRequest == nil {
+		return ErrHandlersIncomplete
+	}
+	if h.Run == nil && h.OnMessage == nil {
 		return ErrHandlersIncomplete
 	}
 	return nil

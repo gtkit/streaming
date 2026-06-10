@@ -9,6 +9,12 @@ import "context"
 //   - ParseRequest / Run 必填;OnConnect 可选(nil 时桥接层 skip)
 //   - ParseRequest 必须**快**(只做 JSON 解析 + 字段校验,不调 DB / 网络);
 //     若需要重操作放到 Run 内,因为 Run 跑在独立的 processLoop 串行段不阻塞 readLoop
+//
+// 隔离警告:若把同一个 Handlers 值复用于多次 Serve 调用(典型:提升为包级变量挂在
+// 路由上),其中的函数闭包捕获的任何可变状态都会被**该路由的所有连接(所有用户)共享**,
+// 既是数据竞争也是用户间串台。连接级状态一律经 ParseRequest 返回的 req 传递
+// (wssession 会原样带给 Run / 后续轮次),或在每次请求内现场构造 Handlers,
+// 让闭包只捕获 per-request 局部量(README 示例即此模式)。
 type Handlers struct {
 	// OnConnect 可选,Upgrade 成功 + 进 lifecycle goroutine 之前调一次。
 	//
@@ -28,9 +34,12 @@ type Handlers struct {
 
 	// Run 业务推送循环。
 	//   - 内部通过 sink.Push(payload) 推帧(payload 由 wssession 用 JSON 序列化)
-	//   - return nil → 自然结束,wssession 下发 normal closure
+	//   - return nil → 自然结束:单向模式下 wssession flush 完在途帧后下发
+	//     close(1000) 握手并主动关闭连接;双向模式下连接保持(对话由 OnMessage 继续)
 	//   - return ErrSlowConsumer → 桥接层下发 error(429) + close
-	//   - return 其他 err → 桥接层下发 error(500 / 422 视 sentinel)+ close
+	//   - return 其他 err → 桥接层下发 error(500) + close
+	//
+	// 单向与双向模式的错误处置一致(均经 dispatchRunError 分发)。
 	//
 	// Run 是 blocking 调用,跑在 processLoop 内;不要在 Run 内 spawn goroutine 后立即 return,
 	// 否则桥接层会以为业务已结束。如需异步处理,在 Run 内自己用 errgroup 编排再 return。
@@ -43,11 +52,13 @@ type Handlers struct {
 	//
 	// 双向模式下,首帧仍由 ParseRequest 处理(订阅/鉴权);此后客户端发送的每条业务帧
 	// 都触发一次 OnMessage(turnCtx, raw, sink),在独立 goroutine 中运行,不阻塞读循环。
-	// 新消息到达会 cancel 上一轮的 turnCtx(打断正在进行的生成),同一连接同时至多一个活跃轮次。
+	// 新消息到达会 cancel 上一轮的 turnCtx(打断正在进行的生成),并**等待上一轮
+	// goroutine 退出后才启动新一轮**——同一连接任一时刻严格至多一个 OnMessage 在运行。
 	//
 	// turnCtx 在以下情况被取消:被新消息打断 / 会话超时 / 客户端断开。
 	// OnMessage 实现**必须监听 turnCtx 并及时返回**(如把它传给 LLM 流式调用),
-	// 否则打断无效、连接关闭时会等待其退出。这与 ParseRequest 的"必须快"同性质。
+	// 否则打断会阻塞后续消息的调度、连接关闭时会等待其退出。这与 ParseRequest
+	// 的"必须快"同性质。
 	//
 	// 返回值处置:nil → 该轮正常结束,连接保持;ErrSlowConsumer → error(429)+close;
 	// ctx.Canceled/DeadlineExceeded(被打断/超时)→ 静默;其它 err → error(500)+close。

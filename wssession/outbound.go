@@ -50,6 +50,12 @@ func (s *Session) queue(ctx context.Context, msg outboundMessage) error {
 }
 
 func (s *Session) queueWithTimeout(ctx context.Context, msg outboundMessage, timeout time.Duration) error {
+	// 先确定性检查 ctx:若已取消,select 在"ctx.Done 与入队同时就绪"时会随机
+	// 二选一,可能把帧塞进 writeLoop 已退出(drain 已结束)的 outbox——
+	// 帧不会被写出,done 信号也无人兑现,等待方只能靠兜底超时解围。
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()

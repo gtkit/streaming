@@ -8,6 +8,8 @@ import (
 	"time"
 
 	gtkitjson "github.com/gtkit/json"
+
+	"github.com/gorilla/websocket"
 )
 
 // ============================================================================
@@ -110,7 +112,7 @@ func TestProcessLoopPanicReturnsError(t *testing.T) {
 			Run: func(context.Context, any, PushSink) error { return nil },
 		},
 	}
-	s.inbox <- inboundFrame{raw: []byte("{}"), receivedAt: time.Now()}
+	s.inbox <- inboundFrame{raw: []byte("{}")}
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -136,13 +138,23 @@ func TestCloseWithErrorIdempotent(t *testing.T) {
 	}
 
 	frames := make(chan errorFrame, 4)
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) }) // 测试结束让消费 goroutine 退出(goleak)
 	go func() {
-		for msg := range s.outbox {
-			var f errorFrame
-			_ = gtkitjson.Unmarshal(msg.data, &f)
-			frames <- f
-			if msg.done != nil {
-				close(msg.done)
+		for {
+			select {
+			case msg := <-s.outbox:
+				// error 帧之后会跟一帧 close 控制帧:只统计文本 error 帧,控制帧仅兑现 done
+				if msg.messageType == websocket.TextMessage {
+					var f errorFrame
+					_ = gtkitjson.Unmarshal(msg.data, &f)
+					frames <- f
+				}
+				if msg.done != nil {
+					close(msg.done)
+				}
+			case <-stop:
+				return
 			}
 		}
 	}()

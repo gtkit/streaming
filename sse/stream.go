@@ -42,6 +42,26 @@ func (s *Stream) Event(name string, payload any) error {
 	return s.writer.Event(name, payload)
 }
 
+// EventWithID 发送一条带 `id:` 字段的命名 SSE 事件(断线续传,见 Writer.EventWithID);
+// 响应尚未开始时自动先写 SSE 响应头。
+func (s *Stream) EventWithID(id, name string, payload any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.startLocked()
+
+	return s.writer.EventWithID(id, name, payload)
+}
+
+// Data 发送一条 data-only 帧(OpenAI 风格,见 Writer.Data);
+// 响应尚未开始时自动先写 SSE 响应头。
+func (s *Stream) Data(payload any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.startLocked()
+
+	return s.writer.Data(payload)
+}
+
 // Ping 发送一条标准保活注释帧。
 func (s *Stream) Ping(at time.Time) error {
 	return s.Comment("ping " + at.UTC().Format(time.RFC3339))

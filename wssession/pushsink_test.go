@@ -12,7 +12,7 @@ func TestPushMarshalErrorReturned(t *testing.T) {
 		outbox:  make(chan outboundMessage, 1),
 		options: Options{QueueOfferTimeout: time.Second},
 	}
-	sink := &pushSink{sess: s}
+	sink := PushSink(s) // Session 自身实现 PushSink
 
 	// channel 无法被 JSON 序列化
 	err := sink.Push(t.Context(), map[string]any{"bad": make(chan int)})
@@ -34,7 +34,7 @@ func TestPushSerializesToBytes(t *testing.T) {
 		outbox:  make(chan outboundMessage, 1),
 		options: Options{QueueOfferTimeout: time.Second},
 	}
-	sink := &pushSink{sess: s}
+	sink := PushSink(s) // Session 自身实现 PushSink
 
 	if err := sink.Push(t.Context(), map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("Push error = %v", err)

@@ -149,11 +149,48 @@ func pollOrder(id string) (done bool, payload any, err error) {
 | `sse.New(c) *Writer` | 低层写入器，需手动 `WriteHeaders()` |
 | `sse.NewStream(c) *Stream` | 业务层封装，首次写自动写头 |
 | `(*Stream).Event(name, payload) error` | 发命名事件（payload 自动 JSON 序列化） |
+| `(*Stream).EventWithID(id, name, payload) error` | 发带 `id:` 的命名事件（断线续传锚点） |
+| `(*Stream).Data(payload) error` | data-only 帧（OpenAI 风格，无事件名） |
 | `(*Stream).Comment(text) error` / `Ping(at)` | 注释帧 / 标准心跳 |
 | `(*Stream).Retry(ms) error` | 下发客户端建议重连间隔 |
 | `(*Stream).Context() context.Context` | 请求上下文（监听断开） |
+| `sse.LastEventID(c) string` | 读取重连请求的 `Last-Event-ID` 头 |
 
 > **并发安全**：`Stream` 用互斥锁串行化所有写方法，可从不同 goroutine（如心跳 goroutine + 业务 goroutine）并发调用；底层 `Writer` **非并发安全**，多 goroutine 写同一连接请用 `Stream`。
+>
+> **写入硬化**：事件名 / id 含换行或 NUL 时返回错误（防 SSE 帧注入）；每帧 flush 失败（客户端已断开）当帧报错，不会对死连接持续推送。
+
+### 断线续传（id + Last-Event-ID）
+
+`EventSource` 断线后会**自动重连**并把最后收到的事件 id 放进 `Last-Event-ID` 请求头。给事件标上 id、重连时从断点续推：
+
+```go
+func handleNotifications(c *gin.Context) {
+	stream := sse.NewStream(c)
+	since := sse.LastEventID(c) // 重连时为客户端最后收到的 id；首连为空串
+	for _, ev := range loadEventsSince(since) {
+		if err := stream.EventWithID(ev.ID, "notice", ev); err != nil {
+			return
+		}
+	}
+	// ……继续实时推送，每条都带 id
+}
+```
+
+> 本包只传递断点（`id:` 写入 + `Last-Event-ID` 读取），事件缓存与重放策略由业务实现。
+
+### data-only 帧（OpenAI 风格）
+
+做 LLM 代理 / OpenAI 兼容接口时，流式块是纯 `data:` 行（无事件名）、以字面 `data: [DONE]` 结尾：
+
+```go
+for chunk := range llmStream(ctx) {
+	if err := stream.Data(chunk); err != nil { // data: {"delta":"..."}
+		return
+	}
+}
+_ = stream.Data(gtkitjson.RawMessage("[DONE]")) // data: [DONE]（RawMessage 原样透传）
+```
 
 ### POST + 请求体发起 SSE（如 LLM 流式响应）
 
@@ -507,9 +544,11 @@ func loadUserUpdates(userID string) (done bool, payload any) {
 
 ### 双向多轮对话（LLM 流式）
 
-默认 wssession 是"订阅后只收不发"的单向模型。要在**单个连接里多轮双向对话**（用户反复发消息、AI 流式回复、可被新消息打断），提供 `Handlers.OnMessage` 即进入**双向模式**：首帧仍由 `ParseRequest` 处理（会话初始化 / 鉴权），其后每条客户端消息触发一轮 `OnMessage`，在独立 goroutine 运行；**新消息到达会 cancel 上一轮的 `turnCtx`（打断正在进行的生成）**，同一连接同时至多一个活跃轮次。
+默认 wssession 是"订阅后只收不发"的单向模型。要在**单个连接里多轮双向对话**（用户反复发消息、AI 流式回复、可被新消息打断），提供 `Handlers.OnMessage` 即进入**双向模式**：首帧仍由 `ParseRequest` 处理（会话初始化 / 鉴权），其后每条客户端消息触发一轮 `OnMessage`，在独立 goroutine 运行；**新消息到达会 cancel 上一轮的 `turnCtx`（打断正在进行的生成），并等上一轮 goroutine 退出后才启动新一轮**——同一连接任一时刻严格至多一个 `OnMessage` 在运行，被打断的旧轮不会在新轮启动后继续推过期帧。
 
-> 双向模式下 `OnMessage` **必须监听 `turnCtx` 并及时返回**（把它传给 LLM 流式调用），否则打断无效、连接关闭时会等待其退出——与 `ParseRequest`"必须快"同性质。
+> 双向模式下 `OnMessage` **必须监听 `turnCtx` 并及时返回**（把它传给 LLM 流式调用），否则打断会阻塞后续消息的调度、连接关闭时会等待其退出——与 `ParseRequest`"必须快"同性质。
+
+入站限速（`InboundRatePerSecond`）触发时，被丢弃的每条消息都会上报 `EventRateLimited` 事件，但**同一连续限速期内只向客户端下发一帧 `error(429)` 提示**（限速恢复后再次超限会重新提示一帧）。双向模式下后台 `Run` 的错误处置与单向模式一致：`ErrSlowConsumer` → `error(429)` + close，其它错误 → `error(500)` + close。
 
 服务端：
 
@@ -604,8 +643,14 @@ function sendPrompt(text) { ws.send(text); }
 | 业务推送（`sink.Push` 的 payload） | 由业务 payload 决定（原样 JSON 序列化） |
 | 各类错误 / 超时 | `{"event":"error","code":<码>,"reason":"...","timestamp":"..."}` |
 
-错误码：`408` 首帧超时、`415` 非文本帧、`422` 解析失败、`429` 连接超限/慢消费、`500` 内部错误
-（常量见 `wssession/errors.go`：`CodeFirstFrameTimeout` / `CodeInvalidParam` / `CodeTooManyConn` 等）。
+错误码：`408` 首帧超时、`409` 被顶下线（`Session.Kick`，客户端**不应**自动重连）、`415` 非文本帧、
+`422` 解析失败、`429` 连接超限/慢消费、`500` 内部错误
+（常量见 `wssession/errors.go`：`CodeFirstFrameTimeout` / `CodeConflict` / `CodeInvalidParam` / `CodeTooManyConn` 等）。
+
+**关闭语义（WebSocket close 握手）**：服务端主动关闭一律先完成 close 握手再断开——
+`Run` 正常结束（返回 nil）→ flush 完在途帧后发 close `1000`；错误关闭 → 先发上表的 `error` JSON 帧，
+再发 close 帧（`408/409/415/422/429` → `1008`，`500` → `1011`）；会话超时 / 上游取消（服务端单方面终止，
+客户端应重连）→ best-effort 发 close `1001`。客户端 `onclose` 收到 `1006` 即代表真实网络异常（非服务端主动关闭）。
 
 ### 客户端 IP 与可信代理
 
@@ -641,9 +686,9 @@ for key, n := range wssession.ConnCapSnapshot() {
 
 > 注：1006 异常断开会通过 `OnEvent` 上报 `EventAbnormalClose`，但**不**作为 `Serve` 的错误返回——避免把常见的客户端网络抖动变成调用方的错误误报。
 
-### 多端会话识别（sessionhub）
+### 多端会话管理（sessionhub）
 
-同一用户可能有多个并发连接（多设备 / 多标签页）。可选子包 `wssession/sessionhub` 提供按 userID **注册 / 注销 / 枚举**活跃连接的轻量注册表（仅识别枚举，不含踢出 / 定向推送）。它独立于核心包、不持有 `*Session`，集成靠 `Serve` 是阻塞调用——`register → defer release → Serve`：
+同一用户可能有多个并发连接（多设备 / 多标签页）。可选子包 `wssession/sessionhub` 提供按 userID 管理活跃连接的轻量注册表：**枚举元数据**（`List` / `Count` / `Users` / `Total`）、**定向推送 / 踢下线**（`RegisterConn` 登记连接句柄 + `Conns` 枚举操作）。它与核心包零 import 依赖（`*wssession.Session` 结构性满足 `sessionhub.Conn` 接口），集成靠 `Serve` 是阻塞调用——`register → defer release → Serve`：
 
 ```go
 package main
@@ -674,6 +719,7 @@ func main() {
 
 func handleWS(c *gin.Context) {
 	// userID 来自首帧 token：用闭包把 release 从 ParseRequest 回传到 handler 的 defer
+	var sess *wssession.Session
 	var release func()
 	defer func() {
 		if release != nil {
@@ -684,9 +730,18 @@ func handleWS(c *gin.Context) {
 	_ = wssession.Serve(c.Request.Context(), c.Writer, c.Request,
 		wssession.Options{},
 		wssession.Handlers{
-			ParseRequest: func(_ context.Context, raw []byte) (key string, req any, err error) {
+			// OnConnect 拿到 *Session 作为连接句柄（Push / Kick）
+			OnConnect: func(_ context.Context, s *wssession.Session) error {
+				sess = s
+				return nil
+			},
+			ParseRequest: func(ctx context.Context, raw []byte) (key string, req any, err error) {
 				userID := parseUserID(raw)
-				_, release = hub.Register(userID) // 登记；Serve 返回（连接结束）时 defer 注销
+				// 单点登录：踢掉同 userID 的旧连接（被踢端收到 error 409 + close 1008，不应自动重连）
+				for _, old := range hub.Conns(userID) {
+					old.Kick(ctx, "logged in elsewhere")
+				}
+				_, release = hub.RegisterConn(userID, sess) // 登记；Serve 返回（连接结束）时 defer 注销
 				return userID, userID, nil
 			},
 			Run: func(ctx context.Context, _ any, _ wssession.PushSink) error {
@@ -700,6 +755,17 @@ func handleWS(c *gin.Context) {
 func parseUserID(raw []byte) string { return "user-1" } // 占位：解析首帧
 ```
 
+向某用户的所有在线端**定向推送**（任意服务端代码处）：
+
+```go
+for _, conn := range hub.Conns("user-1") {
+	_ = conn.Push(ctx, gin.H{"event": "notice", "text": "您有新的订单"})
+}
+```
+
+> **多端策略由业务决定**：允许多端就不踢（只 `RegisterConn` 不 `Kick`）；限制端数就先 `Conns` 检查再决定。`Conns` 返回快照，必须在循环里调 `Kick`（它同步等出帧 flush）——不要在持有自己锁的临界区内调用。
+> 只需要枚举不需要操作时，继续用 `Register`（无句柄，`Conns` 不含这类条目）。
+
 > **握手前鉴权场景更简单**：若 userID 在调 `Serve` 前已知（中间件鉴权放进 ctx），直接 `_, release := hub.Register(userID); defer release()` 再 `Serve(...)` 即可，无需闭包。
 >
 > **SSE 侧**：`sse` 没有连接生命周期 hook，多端识别需业务在 handler 里自行 `hub.Register` + `defer release()`（Stream 的请求 handler 本身也是阻塞的，模式相同）。
@@ -711,7 +777,36 @@ func parseUserID(raw []byte) string { return "user-1" } // 占位：解析首帧
 - `ParseRequest` / `Run` 必填，`OnConnect` 可选；缺必填字段时 `Serve` 返回 `ErrHandlersIncomplete`。
 - `Run` 是 blocking 调用，跑在独立 processLoop；**不要**在 `Run` 内 spawn goroutine 后立即 return
   （否则会被当作业务已结束）。需异步处理就在 `Run` 内自己用 errgroup 编排后再 return。
+- 单向模式下 `Run` 返回 nil 即视为业务结束：`wssession` 会 flush 完在途帧、下发 close(1000) 并主动关闭连接。
+- **Handlers 闭包不要捕获可变状态**：同一个 `Handlers` 值复用于多次 `Serve`（如提升为包级变量）时，
+  闭包捕获的可变状态会被该路由**所有连接（所有用户）共享**——既是数据竞争也是用户间串台。
+  连接级状态经 `ParseRequest` 返回的 `req` 传递，或像本文示例一样在每次请求内现场构造 `Handlers`。
+- `Options.OnEvent` 回调会被多个 goroutine 并发调用，实现必须并发安全且快速非阻塞。
 - `sink.Push` 返回 `ErrSlowConsumer`（出站队列满 + 超时）时，业务应 `return` 让 `wssession` 收敛连接。
+
+### 优雅停机
+
+**陷阱**：`http.Server.Shutdown` 对被 hijack 的连接（WebSocket 正是）**既不关闭也不等待**，且 hijack 之后
+`r.Context()` 不会因 Shutdown 取消——若按上文示例把 `c.Request.Context()` 直接当 parent 传给 `Serve`，
+停机时所有 WS 会话会一直挂到 `MaxSessionDuration`（默认 30 分钟）。
+
+**正确接法**：用进程级 shutdown ctx 作为 `Serve` 的 parent。停机时 cancel，所有会话经既有收敛路径
+向客户端发 close `1001`（GoingAway，客户端据此重连到新实例）并释放：
+
+```go
+shutdownCtx, shutdown := context.WithCancel(context.Background())
+
+r.GET("/ws", func(c *gin.Context) {
+	// parent 同时尊重停机信号与单请求生命周期
+	ctx, cancel := context.WithCancel(shutdownCtx)
+	defer cancel()
+	context.AfterFunc(c.Request.Context(), cancel) // 客户端断开也收敛
+
+	_ = wssession.Serve(ctx, c.Writer, c.Request, opts, handlers)
+})
+
+// 停机流程：先 shutdown() 收敛 WS 会话，再 srv.Shutdown(ctx) 处理普通 HTTP 请求
+```
 
 ### 前端对接（WebSocket）
 

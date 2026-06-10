@@ -33,6 +33,12 @@ type Session struct {
 	// path 用于 connCap key 拼接,在 Serve 入口从 r.URL.Path 提取。
 	path string
 
+	// tokenCapKey 在 processLoop 内 tryAcquire 成功后写入,由 Serve 在连接
+	// 真正结束(group.Wait 之后)释放——cap 占用与连接生命周期对齐,
+	// 不随 processLoop 提前退出而提前释放。
+	// 并发安全:processLoop 写、Serve 在 group.Wait 返回后读,Wait 构成 happens-before。
+	tokenCapKey string
+
 	// subscribed 标记是否已完成首帧 + ParseRequest + tokenCap 三步;
 	// 切到 true 后 readLoop 检测到任何业务帧立即拒。
 	subscribed atomic.Bool
@@ -48,6 +54,14 @@ type Session struct {
 }
 
 const errorFrameQueueOfferTimeout = 500 * time.Millisecond
+
+// closeFrameWriteTimeout 是 ctx 收敛路径 best-effort 发送 close 控制帧的写超时;
+// 客户端假死时最多延迟这么久再裸关,不阻碍连接关闭。
+const closeFrameWriteTimeout = time.Second
+
+// wsWriteBufferPool 供所有连接共享写缓冲(gorilla 仅在写帧瞬间占用),
+// 避免每连接常驻 4KB 写缓冲。
+var wsWriteBufferPool = &sync.Pool{}
 
 // Serve 完成一个 wsmsg 连接的完整托管流程。
 //
@@ -93,6 +107,7 @@ func Serve(parent context.Context, w http.ResponseWriter, r *http.Request, optio
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  4096,
 		WriteBufferSize: 4096,
+		WriteBufferPool: wsWriteBufferPool,
 		CheckOrigin:     newOriginChecker(opts.AllowedOrigins),
 	}
 	wsConn, err := upgrader.Upgrade(w, r, nil)
@@ -115,7 +130,17 @@ func Serve(parent context.Context, w http.ResponseWriter, r *http.Request, optio
 	}
 	defer func() { _ = sess.Close() }()
 
-	// 当 ctx 取消时立刻 close 底层连接,把 readLoop 从 ReadMessage 阻塞中踹醒
+	// token cap 在 processLoop 内 acquire,但占用必须覆盖整条连接的生命周期,
+	// 故释放挂在 Serve 退出(group.Wait 之后),与上面 ipCapKey 的时序一致。
+	defer func() {
+		if sess.tokenCapKey != "" {
+			release(sess.tokenCapKey)
+		}
+	}()
+
+	// 当 ctx 取消时(MaxSessionDuration 到期 / 上游取消)收敛连接,把 readLoop
+	// 从 ReadMessage 阻塞中踹醒。close 握手兜底(1001)在 Close 内统一完成,
+	// 避免多个收敛者(本 watcher / closeNormal / closeWithError)竞争出帧。
 	go func() {
 		<-ctx.Done()
 		_ = sess.Close()
@@ -157,24 +182,35 @@ func Serve(parent context.Context, w http.ResponseWriter, r *http.Request, optio
 	return nil
 }
 
-// Close 幂等关闭底层 WS 连接。
+// Close 幂等关闭底层 WS 连接,关闭前 best-effort 补发 close 握手帧。
 //
-// 在 Serve defer 中 + ctx.Done 监听 goroutine 内均会调用,sync.Once 保证只关一次。
+// 在 Serve defer、ctx.Done 监听 goroutine、closeNormal / closeWithError 内
+// 均会调用,sync.Once 保证只关一次。
+//
+// 兜底握手:若此前已通过 outbox 写出过 close 帧(Run 正常结束的 1000 /
+// 错误关闭的 1008/1011),gorilla 对重复 close 帧返回 ErrCloseSent、不上写,
+// 客户端只看到先到的那帧;若尚未发过(会话超时 / 上游取消 / flush 失败的
+// 服务端单方面终止),则以 1001 GoingAway 完成握手,提示客户端走重连分支,
+// 避免裸关 TCP 让客户端只看到 1006。
 func (s *Session) Close() error {
 	var closeErr error
 	s.closeOnce.Do(func() {
 		if s.wsConn != nil {
+			_ = s.wsConn.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseGoingAway, ""),
+				time.Now().Add(closeFrameWriteTimeout))
 			closeErr = s.wsConn.Close()
 		}
 	})
 	return closeErr
 }
 
-// closeWithError 下发一帧 error JSON,**同步**等 writeLoop flush 完后再 close 底层连接。
+// closeWithError 依次下发一帧 error JSON 与一帧 close 控制帧,**同步**等
+// writeLoop flush 完后再 close 底层连接,完成 WebSocket 关闭握手。
 //
 // 行为约定:
-//   - 入队带 done 信号的 error 帧
-//   - **同步**等 done 关闭(writeLoop 已写出帧)或 1s 兜底超时
+//   - 入队 error 帧,再入队带 done 信号的 close 控制帧(channel FIFO 保证先后)
+//   - **同步**等 done 关闭(writeLoop 已写出两帧)或 1s 兜底超时
 //   - 主动 close 底层 conn,踹醒 readLoop 立刻退出
 //
 // 同步等待是关键:若立即 close,writeLoop 会因 wsConn 关闭而 WriteMessage 失败,
@@ -190,20 +226,53 @@ func (s *Session) closeWithError(ctx context.Context, code int, reason string) {
 			Reason:    truncateErrorReason(reason),
 			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 		}
-		done := make(chan struct{})
-		msg := jsonFrame(frame)
-		msg.done = done
-		if err := s.queueWithTimeout(ctx, msg, errorFrameQueueOfferTimeout); err != nil {
+		if err := s.queueWithTimeout(ctx, jsonFrame(frame), errorFrameQueueOfferTimeout); err != nil {
 			// 入队失败(ctx done / slow consumer)→ 不等 flush,落到下面统一 Close
 			return
 		}
-		// 同步等 writeLoop flush 完 error 帧(1s 兜底,防 writeLoop 因 ctx done 已退出)
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-		}
+		// close 握手帧排在 error 帧之后写出,done 挂在最后一帧上,单次等待覆盖两帧。
+		s.flushCloseFrame(ctx, wsCloseCode(code), errorFrameQueueOfferTimeout)
 	})
 	_ = s.Close()
+}
+
+// closeNormal 发送 close(1000) 握手帧并等 flush 后关闭连接。
+//
+// 用于单向模式 Run 正常返回后的主动收敛:channel FIFO 保证 Run 已 Push 的
+// 尾部业务帧先于 close 帧写出。conn 关闭后 readLoop 解阻塞返回预期 close
+// 错误,errgroup 随之收敛,连接不再悬挂等客户端断开或 MaxSessionDuration。
+func (s *Session) closeNormal(ctx context.Context) {
+	s.flushCloseFrame(ctx, websocket.CloseNormalClosure, s.options.QueueOfferTimeout)
+	_ = s.Close()
+}
+
+// flushCloseFrame 入队一帧 close 控制帧并同步等 writeLoop 写出;
+// ctx 取消(连接已在收敛,close 握手由 Serve 的 ctx watcher best-effort 兜底)
+// 或入队失败时直接放弃,由调用方裸关。1s 兜底防 writeLoop 恰在入队后退出。
+func (s *Session) flushCloseFrame(ctx context.Context, wsCode int, offerTimeout time.Duration) {
+	done := make(chan struct{})
+	msg := outboundMessage{
+		messageType: websocket.CloseMessage,
+		data:        websocket.FormatCloseMessage(wsCode, ""),
+		done:        done,
+	}
+	if err := s.queueWithTimeout(ctx, msg, offerTimeout); err != nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+	}
+}
+
+// wsCloseCode 把下发给客户端的业务错误码映射为 WebSocket close code:
+// 500 → 1011(internal error),其余(408/415/422/429)→ 1008(policy violation)。
+func wsCloseCode(code int) int {
+	if code == CodeInternal {
+		return websocket.CloseInternalServerErr
+	}
+	return websocket.ClosePolicyViolation
 }
 
 func truncateErrorReason(reason string) string {

@@ -25,10 +25,14 @@ var (
 // 错误码常量 — 与 docs/wsmsg-flow.md §5 错误码映射表对齐。
 const (
 	CodeFirstFrameTimeout = 408
-	CodeInvalidFrameType  = 415
-	CodeInvalidParam      = 422
-	CodeTooManyConn       = 429
-	CodeInternal          = 500
+	// CodeConflict 会话冲突:连接被同一身份的新会话顶下线(Session.Kick 下发)。
+	// 客户端收到 error(409) 应提示"已在其他设备登录"且**不**自动重连
+	// (与 close 1001 的"应重连"语义相反);WS 层 close code 映射为 1008。
+	CodeConflict         = 409
+	CodeInvalidFrameType = 415
+	CodeInvalidParam     = 422
+	CodeTooManyConn      = 429
+	CodeInternal         = 500
 )
 
 const maxErrorReasonLen = 256

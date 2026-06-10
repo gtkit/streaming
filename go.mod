@@ -6,6 +6,7 @@ require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/gtkit/json v0.2.11
+	go.uber.org/goleak v1.3.0
 	golang.org/x/sync v0.20.0
 )
 

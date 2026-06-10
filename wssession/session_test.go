@@ -392,11 +392,12 @@ func TestCloseWithErrorTruncatesLongReason(t *testing.T) {
 
 	captured := make(chan errorFrame, 1)
 	go func() {
-		msg := <-s.outbox
+		msg := <-s.outbox // error 帧(done 为 nil)
 		var f errorFrame
 		_ = gtkitjson.Unmarshal(msg.data, &f)
 		captured <- f
-		close(msg.done)
+		closeMsg := <-s.outbox // close 握手帧,done 挂在这一帧上
+		close(closeMsg.done)
 	}()
 
 	s.closeWithError(t.Context(), CodeInvalidParam, strings.Repeat("x", maxErrorReasonLen+32))

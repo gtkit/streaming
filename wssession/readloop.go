@@ -12,8 +12,7 @@ import (
 //
 // 包内私有(业务侧不直接处理 inbound,首帧由 processLoop 调 Handlers.ParseRequest)。
 type inboundFrame struct {
-	raw        []byte
-	receivedAt time.Time
+	raw []byte
 }
 
 // readLoop 是底层唯一 reader。
@@ -70,7 +69,7 @@ func (s *Session) readLoop(ctx context.Context, cancel context.CancelFunc) (err 
 		}
 
 		// 扔进 inbox channel,processLoop 消费
-		frame := inboundFrame{raw: raw, receivedAt: time.Now().UTC()}
+		frame := inboundFrame{raw: raw}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

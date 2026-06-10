@@ -62,17 +62,17 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (e
 	}
 
 	// ④ token 维度 connCap(key 为空时跳过,让 handler 业务自己拒)
-	var tokenCapKey string
 	if key != "" && s.options.ConnCapEnabled {
-		tokenCapKey = "token:" + key + ":" + s.path
+		tokenCapKey := "token:" + key + ":" + s.path
 		_, ok := tryAcquire(tokenCapKey, s.options.ConnCapKeyMax)
 		if !ok {
 			s.options.emit(ctx, Event{Type: EventCapRejected, Reason: ReasonTooManyTokenConn, Key: tokenCapKey})
 			s.closeWithError(ctx, CodeTooManyConn, ReasonTooManyTokenConn)
 			return errors.New("wssession: token connCap exceeded")
 		}
-		// 用 defer 在 processLoop 退出时释放,保证一一对应 tryAcquire
-		defer release(tokenCapKey)
+		// 释放挂在 Serve 退出路径(见 Session.tokenCapKey):cap 占用覆盖整条
+		// 连接的生命周期,不随 processLoop 提前退出而提前释放。
+		s.tokenCapKey = tokenCapKey
 	}
 
 	// ⑤ 状态机切到 Subscribed + 下发订阅确认帧
@@ -86,7 +86,8 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (e
 		return err
 	}
 
-	sink := &pushSink{sess: s}
+	// Session 自身实现 PushSink(见 pushsink.go)
+	sink := PushSink(s)
 
 	// ⑥ 双向模式(OnMessage 非 nil):进入消息调度循环(Run 若提供则后台并行)
 	if s.handlers.OnMessage != nil {
@@ -98,13 +99,16 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (e
 	return s.dispatchRunError(ctx, s.handlers.Run(ctx, req, sink))
 }
 
-// dispatchRunError 把(单向 Run / 双向后台 Run / 一轮 OnMessage)的返回值
-// 映射到连接级 close 行为:nil 保持;ErrSlowConsumer→429+close;
+// dispatchRunError 把(单向 Run / 双向后台 Run)的返回值映射到连接级 close 行为:
+// nil→close(1000) 握手 + 主动收敛;ErrSlowConsumer→429+close;
 // ctx 取消(预期)静默;其它→500+close。
 func (s *Session) dispatchRunError(ctx context.Context, runErr error) error {
 	switch {
 	case runErr == nil:
-		// 正常结束:走 closeNormal 路径(由 Session.Serve 的 cleanup 处理)
+		// 正常结束:flush 完在途业务帧后发 close(1000) 握手并关闭连接——
+		// 不能只 return nil:errgroup 仅在非 nil error 时取消 ctx,
+		// 否则 readLoop/writeLoop 会靠 Ping/Pong 悬挂到 MaxSessionDuration。
+		s.closeNormal(ctx)
 		return nil
 	case errors.Is(runErr, ErrSlowConsumer):
 		s.options.emit(ctx, Event{Type: EventSlowConsumer, Reason: ReasonSlowConsumer, Err: runErr})

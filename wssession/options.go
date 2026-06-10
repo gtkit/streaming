@@ -149,7 +149,9 @@ type Options struct {
 	// 上报时机:panic / 慢消费者 / 连接 cap 拒绝 / 1006 异常断开(见 EventType)。
 	// nil 时桥接层跳过上报。本包不绑定日志栈,事件记录方式由调用方决定。
 	//
-	// 回调必须**快且非阻塞**(同步调用,会短暂参与连接收敛路径);回调内的 panic
+	// 回调必须**快且非阻塞**(同步调用,会短暂参与连接收敛路径),且必须
+	// **并发安全**:同一连接的 readLoop / processLoop / turn goroutine / ctx
+	// watcher 都可能触发上报,多连接场景下并发度更高。回调内的 panic
 	// 会被桥接层 recover,不影响连接生命周期。
 	OnEvent func(ctx context.Context, ev Event)
 }

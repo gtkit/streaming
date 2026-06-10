@@ -19,17 +19,23 @@ type turn struct {
 // 职责:
 //   - 每条入站业务帧派生一个可 cancel 的 turnCtx + goroutine 跑 OnMessage;
 //   - 新消息到达时,若上一轮仍在运行则 cancel 它(打断)并上报 EventTurnInterrupted,
-//     再开启新一轮——同一连接同时至多一个活跃 turn;
-//   - 入站限速:超额消息丢弃 + 下发 error(429) + 上报 EventRateLimited,不关连接;
+//     **等其 goroutine 退出后**再开启新一轮——同一连接任一时刻严格至多一个
+//     OnMessage 在运行,被打断的旧轮不会在新轮启动后继续向 sink 推过期帧;
+//   - 入站限速:超额消息丢弃 + 上报 EventRateLimited,同一连续限速期只下发
+//     一帧 error(429) 提示,不关连接;
 //   - 收敛:ctx 取消时 cancel 活跃 turn 并 wg.Wait 等所有 turn 退出,杜绝 goroutine 泄漏。
 //
 // 首帧已被 ParseRequest 当订阅/鉴权帧消费;duplexLoop 处理其后的每条消息。
-// 双向模式下 Run 可选:若提供,在后台 goroutine 并行运行(用于主动推送),其异常收敛整连接。
+// 双向模式下 Run 可选:若提供,在后台 goroutine 并行运行(用于主动推送),
+// 其错误处置与单向模式一致(dispatchRunError)。
 func (s *Session) duplexLoop(ctx context.Context, cancel context.CancelFunc, req any, sink PushSink) error {
 	limiter := newRateLimiter(s.options.InboundRatePerSecond, s.options.InboundRateBurst)
 
 	var wg sync.WaitGroup
 	var active *turn
+	// limitedNotified 标记当前连续限速期内是否已下发过 429 提示帧,
+	// 任一消息重新通过限速即复位——避免限速风暴下重复出帧。
+	limitedNotified := false
 
 	// 收敛:打断活跃 turn + 等所有 turn(含后台 Run)退出
 	defer func() {
@@ -39,7 +45,9 @@ func (s *Session) duplexLoop(ctx context.Context, cancel context.CancelFunc, req
 		wg.Wait()
 	}()
 
-	// 双向模式下 Run 可选:后台并行跑主动推送循环,异常则收敛连接。
+	// 双向模式下 Run 可选:后台并行跑主动推送循环。
+	// 错误处置复用 dispatchRunError(事件 + error 帧 + close),与单向模式一致;
+	// 返回 nil 表示推送循环自然结束,连接保持(对话由 OnMessage 继续)。
 	if s.handlers.Run != nil {
 		wg.Go(func() {
 			defer func() {
@@ -50,6 +58,7 @@ func (s *Session) duplexLoop(ctx context.Context, cancel context.CancelFunc, req
 			}()
 			if err := s.handlers.Run(ctx, req, sink); err != nil &&
 				!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				_ = s.dispatchRunError(ctx, err)
 				cancel() // 后台 Run 异常 → 收敛连接
 			}
 		})
@@ -61,16 +70,28 @@ func (s *Session) duplexLoop(ctx context.Context, cancel context.CancelFunc, req
 			return ctx.Err()
 		case frame := <-s.inbox:
 			if !limiter.allow() {
-				s.emitRateLimited(ctx)
+				s.options.emit(ctx, Event{Type: EventRateLimited, Reason: "inbound rate limited"})
+				if !limitedNotified {
+					limitedNotified = true
+					s.offerRateLimitedFrame()
+				}
 				continue
 			}
-			// 打断仍在运行的上一轮(已自然结束的不算打断)
+			limitedNotified = false
+			// 打断仍在运行的上一轮(已自然结束的不算打断),并等其退出:
+			// 守约的 OnMessage(契约要求监听 turnCtx)毫秒级返回;失约的会经
+			// inbox→readLoop 反压,最终由 PongWait 终结连接。
 			if active != nil {
 				select {
 				case <-active.done:
 				default:
 					active.cancel()
 					s.options.emit(ctx, Event{Type: EventTurnInterrupted, Reason: "interrupted by new message"})
+					select {
+					case <-active.done:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
 				}
 			}
 			active = s.startTurn(ctx, cancel, &wg, frame.raw, sink)
@@ -117,12 +138,12 @@ func (s *Session) startTurn(ctx context.Context, cancel context.CancelFunc, wg *
 	return t
 }
 
-// emitRateLimited 上报限速事件并向客户端**非阻塞**下发一帧 error(429),不关闭连接。
+// offerRateLimitedFrame 向客户端**非阻塞**下发一帧 error(429) 限速提示,不关闭连接。
 //
 // 用非阻塞 send:限速恰是高频刷消息时触发,若用阻塞的 queue,满了会卡住调度循环
 // 最多 QueueOfferTimeout——那等于让攻击者拖慢正常处理。outbox 满则丢弃这帧提示。
-func (s *Session) emitRateLimited(ctx context.Context) {
-	s.options.emit(ctx, Event{Type: EventRateLimited, Reason: "inbound rate limited"})
+// 调用频率由 duplexLoop 的 limitedNotified 控制:同一连续限速期只发一帧。
+func (s *Session) offerRateLimitedFrame() {
 	frame := jsonFrame(errorFrame{
 		Event:     "error",
 		Code:      CodeTooManyConn,

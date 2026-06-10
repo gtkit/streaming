@@ -3,9 +3,11 @@
 package sse
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -35,41 +37,123 @@ func New(c *gin.Context) *Writer {
 func (w *Writer) WriteHeaders() {
 	// SSE 是长连接：必须解除 http.Server.WriteTimeout 对本条连接的写截止时间，
 	// 否则待支付订单、LLM 长响应会在全局 WriteTimeout 到期时被服务端 RST。
-	// SetWriteDeadline(time.Time{}) 表示不设超时；在 httptest 等不支持的 writer 上
-	// 会返回 http.ErrNotSupported，此时忽略即可——生产 net/http.Server 始终支持。
+	// SetWriteDeadline(time.Time{}) 表示不设超时；失败（httptest 的
+	// http.ErrNotSupported / 连接已半关）不影响响应头继续下发，让后续 Write 自然报错。
 	rc := http.NewResponseController(w.c.Writer)
-	if err := rc.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
-		// 非预期错误（例如连接已半关），不影响响应头继续下发；让后续 Write 自然报错。
-		_ = err
-	}
+	_ = rc.SetWriteDeadline(time.Time{})
 
 	w.c.Header("Content-Type", "text/event-stream; charset=utf-8")
 	w.c.Header("Cache-Control", "no-store, no-cache")
-	w.c.Header("Connection", "keep-alive")
+	// Connection 是连接级头部,HTTP/2(RFC 9113)禁止;仅 HTTP/1.x 设置。
+	if w.c.Request.ProtoMajor == 1 {
+		w.c.Header("Connection", "keep-alive")
+	}
 	w.c.Header("X-Accel-Buffering", "no")
+	w.c.Header("X-Content-Type-Options", "nosniff")
 	w.c.Status(http.StatusOK)
 }
 
 // Event 写入一条命名 SSE 事件，payload 自动 JSON 序列化；写入带 per-write deadline。
+// name 含 \r / \n / NUL 时返回错误（防 SSE 帧注入），不写出任何字节。
 func (w *Writer) Event(name string, payload any) error {
+	return w.writeEvent("", name, payload)
+}
+
+// EventWithID 写入一条带 `id:` 字段的命名 SSE 事件，用于断线续传：
+// EventSource 自动重连时会把最后收到的 id 放进 `Last-Event-ID` 头回传
+// （服务端用 LastEventID 读取，自行决定从哪续推）。
+// id 为空串时不输出 `id:` 行，行为等同 Event。
+// id / name 含 \r / \n / NUL 时返回错误（防 SSE 帧注入），不写出任何字节。
+func (w *Writer) EventWithID(id, name string, payload any) error {
+	return w.writeEvent(id, name, payload)
+}
+
+// Data 写入一条 data-only 帧（仅 `data:` 行，无事件名），即 OpenAI 风格的
+// 流式块格式；payload 自动 JSON 序列化，RawMessage 原样透传——
+// 终止哨兵可写作 Data(gtkitjson.RawMessage("[DONE]"))，输出字面 `data: [DONE]`。
+// 前端经 EventSource 的 onmessage（默认事件）接收。
+func (w *Writer) Data(payload any) error {
+	return w.writeEvent("", "", payload)
+}
+
+// writeEvent 是 Event / EventWithID / Data 共用的帧写入:id / name 为空串的
+// 字段行省略,payload JSON 序列化为 data 行。
+func (w *Writer) writeEvent(id, name string, payload any) error {
 	select {
 	case <-w.c.Request.Context().Done():
 		return w.c.Request.Context().Err()
 	default:
 	}
 
-	data, err := gtkitjson.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal sse payload: %w", err)
+	if err := validateFieldValue("id", id); err != nil {
+		return err
+	}
+	if err := validateFieldValue("event name", name); err != nil {
+		return err
 	}
 
+	// RawMessage 绕过序列化原样透传(gtkitjson.Marshal 会校验 JSON 合法性,
+	// 而 OpenAI 风格的 `[DONE]` 哨兵不是合法 JSON);其余 payload 正常序列化。
+	var data []byte
+	if raw, ok := payload.(gtkitjson.RawMessage); ok {
+		data = raw
+	} else {
+		marshaled, err := gtkitjson.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal sse payload: %w", err)
+		}
+		data = marshaled
+	}
+
+	var frame strings.Builder
+	if id != "" {
+		frame.WriteString("id: ")
+		frame.WriteString(id)
+		frame.WriteByte('\n')
+	}
+	if name != "" {
+		frame.WriteString("event: ")
+		frame.WriteString(name)
+		frame.WriteByte('\n')
+	}
+	// data 含换行时按 SSE 规范拆成多个 data: 行(客户端以 \n 重新拼接)。
+	// Marshal 输出换行必转义、走快路径;只有 raw 透传可能含裸换行,
+	// 拆行同时关死该路径的帧注入面。
+	if !bytes.ContainsAny(data, "\r\n") {
+		frame.WriteString("data: ")
+		frame.Write(data)
+		frame.WriteByte('\n')
+	} else {
+		for line := range strings.SplitSeq(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
+			frame.WriteString("data: ")
+			frame.WriteString(line)
+			frame.WriteByte('\n')
+		}
+	}
+	frame.WriteByte('\n')
+
 	return w.withWriteDeadline(func() error {
-		if _, err := fmt.Fprintf(w.c.Writer, "event: %s\ndata: %s\n\n", name, data); err != nil {
+		if _, err := io.WriteString(w.c.Writer, frame.String()); err != nil {
 			return fmt.Errorf("write sse event: %w", err)
 		}
-		w.c.Writer.Flush()
-		return nil
+		return w.flush()
 	})
+}
+
+// validateFieldValue 拒绝含换行 / NUL 的 SSE 字段值:换行可注入伪造帧,
+// NUL 是 SSE 规范明确禁止的 id 字符。非法字段是调用方编程错误,直接报错不转义。
+func validateFieldValue(field, v string) error {
+	if strings.ContainsAny(v, "\r\n\x00") {
+		return fmt.Errorf("sse: %s must not contain newline or NUL: %q", field, v)
+	}
+	return nil
+}
+
+// LastEventID 返回 EventSource 自动重连时携带的 `Last-Event-ID` 请求头
+// （即客户端最后收到的 EventWithID 的 id），无则返回空串。
+// 服务端据此决定断线续推的起点;本包不做事件缓存,重放策略由业务实现。
+func LastEventID(c *gin.Context) string {
+	return c.GetHeader("Last-Event-ID")
 }
 
 // Comment 写入一条 SSE 注释帧。
@@ -92,8 +176,7 @@ func (w *Writer) Comment(text string) error {
 			return fmt.Errorf("write sse comment tail: %w", err)
 		}
 
-		w.c.Writer.Flush()
-		return nil
+		return w.flush()
 	})
 }
 
@@ -111,14 +194,25 @@ func (w *Writer) Retry(milliseconds int) error {
 			return fmt.Errorf("write sse retry: %w", err)
 		}
 
-		w.c.Writer.Flush()
-		return nil
+		return w.flush()
 	})
 }
 
 // Context 返回绑定到本 SSE 连接的请求上下文。
 func (w *Writer) Context() context.Context {
 	return w.c.Request.Context()
+}
+
+// flush 把帧冲刷到客户端并暴露错误:相比 gin 的 void Flush,
+// http.ResponseController.Flush 返回 error,客户端断开能在当帧发现,
+// 而非等 TCP 缓冲塞满后才从下一次 Write 报错(LLM 流场景避免对死连接白推)。
+// writer 不支持 Flush(http.ErrNotSupported,如 httptest 包装层)时静默降级,
+// 与 SetWriteDeadline 的降级策略一致。
+func (w *Writer) flush() error {
+	if err := http.NewResponseController(w.c.Writer).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return fmt.Errorf("flush sse: %w", err)
+	}
+	return nil
 }
 
 func (w *Writer) withWriteDeadline(fn func() error) error {

@@ -325,8 +325,8 @@ func TestQueueSlowConsumer(t *testing.T) {
 
 	start := time.Now()
 	err := s.queue(t.Context(), outboundMessage{
-		isJSON:      true,
-		jsonPayload: map[string]any{"x": 1},
+		messageType: websocket.TextMessage,
+		data:        []byte(`{"x":1}`),
 	})
 	elapsed := time.Since(start)
 
@@ -352,7 +352,7 @@ func TestQueueCtxCancelDuringWait(t *testing.T) {
 	}()
 
 	start := time.Now()
-	err := s.queue(ctx, outboundMessage{isJSON: true, jsonPayload: "x"})
+	err := s.queue(ctx, outboundMessage{messageType: websocket.TextMessage, data: []byte(`"x"`)})
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, context.Canceled) {
@@ -393,7 +393,9 @@ func TestCloseWithErrorTruncatesLongReason(t *testing.T) {
 	captured := make(chan errorFrame, 1)
 	go func() {
 		msg := <-s.outbox
-		captured <- msg.jsonPayload.(errorFrame)
+		var f errorFrame
+		_ = gtkitjson.Unmarshal(msg.data, &f)
+		captured <- f
 		close(msg.done)
 	}()
 

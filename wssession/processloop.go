@@ -78,13 +78,10 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (e
 	// ⑤ 状态机切到 Subscribed + 下发订阅确认帧
 	s.subscribed.Store(true)
 	subscribedAt := time.Now().UTC()
-	if err := s.queue(ctx, outboundMessage{
-		isJSON: true,
-		jsonPayload: subscribedFrame{
-			Event:     "subscribed",
-			Timestamp: subscribedAt.Format(time.RFC3339Nano),
-		},
-	}); err != nil {
+	if err := s.queue(ctx, jsonFrame(subscribedFrame{
+		Event:     "subscribed",
+		Timestamp: subscribedAt.Format(time.RFC3339Nano),
+	})); err != nil {
 		// subscribed 帧入队失败(反压 / ctx done)→ 直接结束,不再尝试 Run
 		return err
 	}

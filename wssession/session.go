@@ -177,7 +177,7 @@ func (s *Session) Close() error {
 //   - **同步**等 done 关闭(writeLoop 已写出帧)或 1s 兜底超时
 //   - 主动 close 底层 conn,踹醒 readLoop 立刻退出
 //
-// 同步等待是关键:若立即 close,writeLoop 会因 wsConn 关闭而 WriteJSON 失败,
+// 同步等待是关键:若立即 close,writeLoop 会因 wsConn 关闭而 WriteMessage 失败,
 // error 帧丢失,客户端只看到 abnormal closure 而无错误码/原因。
 //
 // 调用方应在调用本方法后 return,让所在的 loop 退出 → errgroup 收敛 → defer Close。
@@ -191,11 +191,9 @@ func (s *Session) closeWithError(ctx context.Context, code int, reason string) {
 			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 		}
 		done := make(chan struct{})
-		if err := s.queueWithTimeout(ctx, outboundMessage{
-			isJSON:      true,
-			jsonPayload: frame,
-			done:        done,
-		}, errorFrameQueueOfferTimeout); err != nil {
+		msg := jsonFrame(frame)
+		msg.done = done
+		if err := s.queueWithTimeout(ctx, msg, errorFrameQueueOfferTimeout); err != nil {
 			// 入队失败(ctx done / slow consumer)→ 不等 flush,落到下面统一 Close
 			return
 		}

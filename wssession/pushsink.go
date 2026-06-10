@@ -1,11 +1,18 @@
 package wssession
 
-import "context"
+import (
+	"context"
+	"fmt"
+
+	gtkitjson "github.com/gtkit/json"
+
+	"github.com/gorilla/websocket"
+)
 
 // PushSink 是业务侧向客户端推帧的唯一入口。
 //
 // 实现细节(outbox channel + writeLoop)对业务透明;
-// 业务只需调 sink.Push(payload) 即可,payload 由 wssession 用 WriteJSON 序列化。
+// 业务只需调 sink.Push(payload) 即可,payload 在 Push 内用 gtkitjson 序列化为文本帧。
 //
 // 队列满 + QueueOfferTimeout(默认 5s)仍无消费 → 返回 ErrSlowConsumer,
 // 业务侧应 return 让 wssession 收敛连接(close 慢客户端)。
@@ -26,8 +33,13 @@ type pushSink struct {
 // 调用方应在 sink.Push 返回 ErrSlowConsumer / ctx.Err 时立即 return Run,
 // 由 wssession 收敛连接。
 func (s *pushSink) Push(ctx context.Context, payload any) error {
+	// 序列化在业务 goroutine 侧完成(可并行),writeLoop 只做纯 IO。
+	data, err := gtkitjson.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("wssession: marshal push payload: %w", err)
+	}
 	return s.sess.queue(ctx, outboundMessage{
-		isJSON:      true,
-		jsonPayload: payload,
+		messageType: websocket.TextMessage,
+		data:        data,
 	})
 }

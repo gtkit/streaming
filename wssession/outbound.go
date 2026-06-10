@@ -3,24 +3,34 @@ package wssession
 import (
 	"context"
 	"time"
+
+	gtkitjson "github.com/gtkit/json"
+
+	"github.com/gorilla/websocket"
 )
+
+// jsonFrame 把一个内部帧结构序列化为待发送的文本帧。
+//
+// 仅用于包内固定结构(subscribedFrame / errorFrame),其序列化不会失败,
+// 故忽略 Marshal 错误;业务 payload 走 PushSink.Push,那里会回传序列化错误。
+func jsonFrame(payload any) outboundMessage {
+	data, _ := gtkitjson.Marshal(payload)
+	return outboundMessage{messageType: websocket.TextMessage, data: data}
+}
 
 // outboundMessage 是 outbox channel 中的一条待发送帧。
 //
-// 同时支持两种写出路径,通过 isJSON 区分:
-//   - isJSON=true  → writeLoop 调 conn.WriteJSON(jsonPayload)
-//   - isJSON=false → writeLoop 调 conn.WriteMessage(messageType, data)
+// data 是**已序列化**的字节,writeLoop 只做 WriteMessage(messageType, data) 纯 IO——
+// JSON 序列化在入队前(Push / 帧构造侧)用 gtkitjson 完成,不在 writeLoop 内做。
 //
 // done 字段是可选的同步信号:writeLoop 写出该帧后会 close(done),
 // 让需要"等待 flush 完成"的调用方(如 closeWithError 下发 error 帧后才能关连接)
 // 同步等待。业务侧 PushSink.Push 不使用 done(异步推帧无需等)。
 //
-// 仅包内使用;业务通过 PushSink.Push 间接入队(只用 isJSON=true + done=nil 路径)。
+// 仅包内使用;业务通过 PushSink.Push 间接入队。
 type outboundMessage struct {
 	messageType int
 	data        []byte
-	jsonPayload any
-	isJSON      bool
 	done        chan struct{}
 }
 

@@ -15,7 +15,7 @@ import (
 //
 // 退出路径:
 //   - ctx.Done() → 自然结束
-//   - outbox 收到的帧 WriteJSON / WriteMessage 失败 → return err 让 errgroup 收敛
+//   - outbox 收到的帧 WriteMessage 失败 → return err 让 errgroup 收敛
 //   - Ping 失败(客户端假死) → return err
 func (s *Session) writeLoop(ctx context.Context, cancel context.CancelFunc) (err error) {
 	defer func() {
@@ -57,8 +57,6 @@ func (s *Session) writeOutbound(msg outboundMessage) error {
 	if err := s.wsConn.SetWriteDeadline(time.Now().Add(s.options.WriteWait)); err != nil {
 		return err
 	}
-	if msg.isJSON {
-		return s.wsConn.WriteJSON(msg.jsonPayload)
-	}
+	// data 已是序列化字节,writeLoop 只做纯 IO。
 	return s.wsConn.WriteMessage(msg.messageType, msg.data)
 }

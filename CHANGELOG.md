@@ -17,8 +17,11 @@
 - `wssession` 新增双向模式：`Handlers.OnMessage` 非 nil 时，单连接支持多轮双向消息（如多轮 LLM 对话）——每条客户端消息触发一轮，**新消息打断上一轮**（每轮一个可 cancel 的 turn context），同时至多一个活跃轮次；`Run` 在双向模式下变为可选（后台主动推送）。`OnMessage` 为 nil 时单向行为完全不变
 - `wssession` 新增 `Options.InboundRatePerSecond` / `InboundRateBurst`：双向模式下单连接入站消息速率限制（令牌桶，标准库实现），超限丢弃并下发 `error(429)`，不关连接
 - `wssession` 新增 `EventType` 值 `EventRateLimited`（入站超速）与 `EventTurnInterrupted`（轮次被打断），经 `OnEvent` 上报
+- 新增可选子包 `wssession/sessionhub`：按 userID 注册 / 注销 / 枚举活跃连接的轻量注册表（多端会话识别，仅枚举），独立于核心包、不持有 `*Session`
 
 ### Changed
+
+- `wssession` 出帧 JSON 序列化前移到 `PushSink.Push` 端（业务 goroutine 并行序列化），`writeLoop` 改为纯 IO；统一用 `gtkitjson`，移除对 gorilla `WriteJSON`（内部 `encoding/json`）的依赖。`Push` 现在会在 payload 无法序列化时立即返回错误（签名不变，兼容增强）
 
 - `wssession` 移除对 `github.com/gtkit/logger` 的直接依赖：内部不再打日志，错误统一通过 `Serve` 返回值上抛，由调用方决定记录方式（符合"库不绑定日志栈"原则）
 - `wssession` 连接计数表改为计数归零即删除条目，占用与当前活跃连接数成正比，消除长期运行的内存无界增长

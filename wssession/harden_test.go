@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	gtkitjson "github.com/gtkit/json"
 )
 
 // ============================================================================
@@ -136,7 +138,9 @@ func TestCloseWithErrorIdempotent(t *testing.T) {
 	frames := make(chan errorFrame, 4)
 	go func() {
 		for msg := range s.outbox {
-			frames <- msg.jsonPayload.(errorFrame)
+			var f errorFrame
+			_ = gtkitjson.Unmarshal(msg.data, &f)
+			frames <- f
 			if msg.done != nil {
 				close(msg.done)
 			}

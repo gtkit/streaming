@@ -103,6 +103,45 @@ func TestDuplexInterrupt(t *testing.T) {
 	}
 }
 
+// TestDuplexInterruptLeakyErrorDoesNotClose:被打断的旧 turn 即使返回了普通业务 error
+// (没如约传播 ctx 取消),也不得误关整条连接——新一轮应正常工作。
+func TestDuplexInterruptLeakyErrorDoesNotClose(t *testing.T) {
+	t.Parallel()
+	path := uniquePath(t)
+	started := make(chan struct{}, 1)
+	h := Handlers{
+		ParseRequest: func(_ context.Context, _ []byte) (string, any, error) { return "tok", nil, nil },
+		OnMessage: func(ctx context.Context, raw []byte, sink PushSink) error {
+			var m map[string]any
+			_ = gtkitjson.Unmarshal(raw, &m)
+			if m["slow"] == true {
+				started <- struct{}{}
+				<-ctx.Done()
+				return errors.New("leaky: did not propagate ctx cancellation") // 不老实
+			}
+			return sink.Push(ctx, map[string]any{"echo": m["text"]})
+		},
+	}
+	srv := newTestSession(t, path, Options{}, h)
+
+	conn, _ := dial(t, wsURL(srv.URL, path))
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"sub":1}`))
+	_ = readJSONFrame(t, conn, 2*time.Second) // subscribed
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"slow":true}`))
+	<-started
+
+	// 打断慢轮:慢轮会返回一个普通业务 error,但 turnCtx 已被取消 → 应静默,不关连接
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"text":"y"}`))
+
+	got := readJSONFrame(t, conn, 2*time.Second)
+	if got["event"] == "error" {
+		t.Fatalf("连接被旧轮的泄漏错误误关:收到 %v", got)
+	}
+	if got["echo"] != "y" {
+		t.Fatalf("echo = %v, want y", got["echo"])
+	}
+}
+
 func TestDuplexTurnCancelledOnClose(t *testing.T) {
 	t.Parallel()
 	path := uniquePath(t)
@@ -154,6 +193,77 @@ func TestDuplexOnMessageError(t *testing.T) {
 	if code, _ := msg["code"].(float64); int(code) != CodeInternal {
 		t.Fatalf("code = %v, want %d", msg["code"], CodeInternal)
 	}
+}
+
+// TestDuplexWithBackgroundRun:双向模式下 Run 可选,作为后台主动推送与 OnMessage 并存。
+func TestDuplexWithBackgroundRun(t *testing.T) {
+	t.Parallel()
+	path := uniquePath(t)
+	h := Handlers{
+		ParseRequest: func(_ context.Context, _ []byte) (string, any, error) { return "tok", nil, nil },
+		Run: func(ctx context.Context, _ any, sink PushSink) error {
+			_ = sink.Push(ctx, map[string]any{"push": "bg"}) // 后台主动推一帧
+			<-ctx.Done()
+			return nil
+		},
+		OnMessage: func(ctx context.Context, _ []byte, sink PushSink) error {
+			return sink.Push(ctx, map[string]any{"echo": "msg"})
+		},
+	}
+	srv := newTestSession(t, path, Options{}, h)
+
+	conn, _ := dial(t, wsURL(srv.URL, path))
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"sub":1}`))
+
+	// 订阅确认后,后台 Run 应推出 push:bg(与 subscribed 帧顺序不定,循环找)
+	sawBg := false
+	for range 4 {
+		f := readJSONFrame(t, conn, 2*time.Second)
+		if f["push"] == "bg" {
+			sawBg = true
+			break
+		}
+	}
+	if !sawBg {
+		t.Fatal("未收到后台 Run 推送的 push:bg")
+	}
+}
+
+func TestDuplexOnMessageSlowConsumer(t *testing.T) {
+	t.Parallel()
+	path := uniquePath(t)
+	h := duplexHandlers(func(context.Context, []byte, PushSink) error {
+		return ErrSlowConsumer
+	})
+	srv := newTestSession(t, path, Options{}, h)
+
+	conn, _ := dial(t, wsURL(srv.URL, path))
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"sub":1}`))
+	_ = readJSONFrame(t, conn, 2*time.Second) // subscribed
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"q":1}`))
+
+	msg := readJSONFrame(t, conn, 2*time.Second)
+	if code, _ := msg["code"].(float64); int(code) != CodeTooManyConn {
+		t.Fatalf("code = %v, want %d", msg["code"], CodeTooManyConn)
+	}
+}
+
+func TestDuplexOnMessagePanic(t *testing.T) {
+	t.Parallel()
+	path := uniquePath(t)
+	events := make(chan Event, 16)
+	h := duplexHandlers(func(context.Context, []byte, PushSink) error {
+		panic("boom in OnMessage")
+	})
+	opts := Options{OnEvent: func(_ context.Context, ev Event) { events <- ev }}
+	srv := newTestSession(t, path, opts, h)
+
+	conn, _ := dial(t, wsURL(srv.URL, path))
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"sub":1}`))
+	_ = readJSONFrame(t, conn, 2*time.Second) // subscribed
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"q":1}`))
+
+	waitForEvent(t, events, EventPanic) // OnMessage panic 被 recover 并上报
 }
 
 func TestDuplexRateLimit(t *testing.T) {

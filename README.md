@@ -641,6 +641,71 @@ for key, n := range wssession.ConnCapSnapshot() {
 
 > 注：1006 异常断开会通过 `OnEvent` 上报 `EventAbnormalClose`，但**不**作为 `Serve` 的错误返回——避免把常见的客户端网络抖动变成调用方的错误误报。
 
+### 多端会话识别（sessionhub）
+
+同一用户可能有多个并发连接（多设备 / 多标签页）。可选子包 `wssession/sessionhub` 提供按 userID **注册 / 注销 / 枚举**活跃连接的轻量注册表（仅识别枚举，不含踢出 / 定向推送）。它独立于核心包、不持有 `*Session`，集成靠 `Serve` 是阻塞调用——`register → defer release → Serve`：
+
+```go
+package main
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gtkit/streaming/wssession"
+	"github.com/gtkit/streaming/wssession/sessionhub"
+)
+
+var hub = sessionhub.New()
+
+func main() {
+	r := gin.New()
+	r.GET("/ws", handleWS)
+	// 运维 / 在线状态：列出某用户当前所有活跃连接
+	r.GET("/users/:id/conns", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"count": hub.Count(c.Param("id")),
+			"conns": hub.List(c.Param("id")),
+		})
+	})
+	_ = r.Run(":8080")
+}
+
+func handleWS(c *gin.Context) {
+	// userID 来自首帧 token：用闭包把 release 从 ParseRequest 回传到 handler 的 defer
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+
+	_ = wssession.Serve(c.Request.Context(), c.Writer, c.Request,
+		wssession.Options{},
+		wssession.Handlers{
+			ParseRequest: func(_ context.Context, raw []byte) (key string, req any, err error) {
+				userID := parseUserID(raw)
+				_, release = hub.Register(userID) // 登记；Serve 返回（连接结束）时 defer 注销
+				return userID, userID, nil
+			},
+			Run: func(ctx context.Context, _ any, _ wssession.PushSink) error {
+				<-ctx.Done()
+				return nil
+			},
+		},
+	)
+}
+
+func parseUserID(raw []byte) string { return "user-1" } // 占位：解析首帧
+```
+
+> **握手前鉴权场景更简单**：若 userID 在调 `Serve` 前已知（中间件鉴权放进 ctx），直接 `_, release := hub.Register(userID); defer release()` 再 `Serve(...)` 即可，无需闭包。
+>
+> **SSE 侧**：`sse` 没有连接生命周期 hook，多端识别需业务在 handler 里自行 `hub.Register` + `defer release()`（Stream 的请求 handler 本身也是阻塞的，模式相同）。
+>
+> **出帧序列化**：`PushSink.Push` 的 payload 在**业务 goroutine 侧**用 `gtkitjson` 序列化（可并行），`writeLoop` 只做纯 IO——大 payload 不阻塞出帧管道。因此 `Push` 现在会在 payload **无法序列化时立即返回错误**（如含 channel 字段）。
+
 ### 关键约束
 
 - `ParseRequest` / `Run` 必填，`OnConnect` 可选；缺必填字段时 `Serve` 返回 `ErrHandlersIncomplete`。

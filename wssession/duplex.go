@@ -95,34 +95,42 @@ func (s *Session) startTurn(ctx context.Context, cancel context.CancelFunc, wg *
 		}()
 
 		// 一轮 OnMessage 的返回值处置:
-		//   nil 保持连接;ErrSlowConsumer→429+close;ctx 取消(被打断/超时)静默;其它→500+close。
 		err := s.handlers.OnMessage(turnCtx, raw, sink)
-		if err == nil ||
-			errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return
-		}
-		if errors.Is(err, ErrSlowConsumer) {
+		switch {
+		case turnCtx.Err() != nil:
+			// 被新消息打断 / 会话结束(turnCtx 已取消):视为预期,不关连接——
+			// 无论业务是否如约把 ctx 取消传播为返回值,都不误杀整条连接。
+		case err == nil:
+			// 该轮正常结束,连接保持
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			// 业务自身 ctx 取消:预期,静默
+		case errors.Is(err, ErrSlowConsumer):
 			s.options.emit(turnCtx, Event{Type: EventSlowConsumer, Reason: ReasonSlowConsumer, Err: err})
 			s.closeWithError(turnCtx, CodeTooManyConn, ReasonSlowConsumer)
-		} else {
+			cancel() // 慢消费者 → 收敛整连接
+		default:
 			s.closeWithError(turnCtx, CodeInternal, ReasonInternalError)
+			cancel() // 业务错误 → 收敛整连接
 		}
-		cancel() // 业务错误 → 收敛整连接
 	})
 
 	return t
 }
 
-// emitRateLimited 上报限速事件并向客户端下发一帧 error(429),不关闭连接。
+// emitRateLimited 上报限速事件并向客户端**非阻塞**下发一帧 error(429),不关闭连接。
+//
+// 用非阻塞 send:限速恰是高频刷消息时触发,若用阻塞的 queue,满了会卡住调度循环
+// 最多 QueueOfferTimeout——那等于让攻击者拖慢正常处理。outbox 满则丢弃这帧提示。
 func (s *Session) emitRateLimited(ctx context.Context) {
 	s.options.emit(ctx, Event{Type: EventRateLimited, Reason: "inbound rate limited"})
-	_ = s.queue(ctx, outboundMessage{
-		isJSON: true,
-		jsonPayload: errorFrame{
-			Event:     "error",
-			Code:      CodeTooManyConn,
-			Reason:    "rate limited",
-			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
-		},
+	frame := jsonFrame(errorFrame{
+		Event:     "error",
+		Code:      CodeTooManyConn,
+		Reason:    "rate limited",
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 	})
+	select {
+	case s.outbox <- frame:
+	default: // outbox 满 → 丢弃限速提示,绝不阻塞调度循环
+	}
 }

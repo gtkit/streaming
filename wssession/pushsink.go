@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	gtkitjson "github.com/gtkit/json"
+	gtkitjson "github.com/gtkit/json/v2"
 
 	"github.com/gorilla/websocket"
 )
@@ -26,12 +26,16 @@ type PushSink interface {
 // Push 把 payload 序列化后塞进该连接的出站队列(实现 PushSink)。
 //
 // 并发安全,可与 Run / OnMessage 的推送并存(出帧由 writeLoop 串行写出,
-// 帧序由入队时刻决定)。返回 ErrSlowConsumer / ctx.Err 时调用方应停止推送。
+// 帧序由入队时刻决定)。返回 ErrSlowConsumer / ErrOutboundFrameTooLarge /
+// ctx.Err 时调用方应停止或丢弃该业务推送。
 func (s *Session) Push(ctx context.Context, payload any) error {
 	// 序列化在业务 goroutine 侧完成(可并行),writeLoop 只做纯 IO。
 	data, err := gtkitjson.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("wssession: marshal push payload: %w", err)
+	}
+	if s.options.MaxOutboundFrameBytes > 0 && len(data) > s.options.MaxOutboundFrameBytes {
+		return fmt.Errorf("wssession: outbound frame size %d exceeds MaxOutboundFrameBytes %d: %w", len(data), s.options.MaxOutboundFrameBytes, ErrOutboundFrameTooLarge)
 	}
 	return s.queue(ctx, outboundMessage{
 		messageType: websocket.TextMessage,

@@ -3,13 +3,14 @@ package wssession
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 
-	gtkitjson "github.com/gtkit/json"
+	gtkitjson "github.com/gtkit/json/v2"
 )
 
 // duplexHandlers 构造双向模式 Handlers:首帧当订阅(任意内容),其后每条走 onMsg。
@@ -101,6 +102,14 @@ func TestDuplexInterrupt(t *testing.T) {
 	if got := readJSONFrame(t, conn, 2*time.Second); got["echo"] != "x" {
 		t.Fatalf("echo = %v, want x", got["echo"])
 	}
+
+	select {
+	case ev := <-events:
+		if ev.Type == EventTurnStuck {
+			t.Fatal("守约 turn 不应上报 EventTurnStuck")
+		}
+	default:
+	}
 }
 
 // TestDuplexInterruptLeakyErrorDoesNotClose:被打断的旧 turn 即使返回了普通业务 error
@@ -142,6 +151,56 @@ func TestDuplexInterruptLeakyErrorDoesNotClose(t *testing.T) {
 	}
 }
 
+func TestDuplexInterruptStuckTurnEmitsEventAndCloses(t *testing.T) {
+	t.Parallel()
+	path := uniquePath(t)
+	events := make(chan Event, 8)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseTurn := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseTurn)
+
+	h := duplexHandlers(func(ctx context.Context, raw []byte, sink PushSink) error {
+		var m map[string]any
+		_ = gtkitjson.Unmarshal(raw, &m)
+		if m["stuck"] == true {
+			started <- struct{}{}
+			<-ctx.Done()
+			<-release
+			return ctx.Err()
+		}
+		return sink.Push(ctx, map[string]any{"echo": m["text"]})
+	})
+	opts := Options{
+		TurnCloseTimeout: 50 * time.Millisecond,
+		OnEvent:          func(_ context.Context, ev Event) { events <- ev },
+	}
+	srv := newTestSession(t, path, opts, h)
+
+	conn, _ := dial(t, wsURL(srv.URL, path))
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"sub":1}`))
+	_ = readJSONFrame(t, conn, 2*time.Second) // subscribed
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"stuck":true}`))
+	<-started
+
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"text":"next"}`))
+	waitForEvent(t, events, EventTurnStuck)
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var msg map[string]any
+		_ = gtkitjson.Unmarshal(raw, &msg)
+		if msg["event"] == "error" {
+			return
+		}
+	}
+}
+
 func TestDuplexTurnCancelledOnClose(t *testing.T) {
 	t.Parallel()
 	path := uniquePath(t)
@@ -171,6 +230,41 @@ func TestDuplexTurnCancelledOnClose(t *testing.T) {
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
+}
+
+func TestDuplexCloseStuckTurnDoesNotWaitForever(t *testing.T) {
+	t.Parallel()
+	path := uniquePath(t)
+	events := make(chan Event, 16)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseTurn := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseTurn)
+	h := duplexHandlers(func(context.Context, []byte, PushSink) error {
+		started <- struct{}{}
+		<-release // 忽略 ctx,直到测试释放
+		return nil
+	})
+	opts := Options{
+		TurnCloseTimeout: 50 * time.Millisecond,
+		OnEvent:          func(_ context.Context, ev Event) { events <- ev },
+	}
+	srv := newTestSession(t, path, opts, h)
+
+	conn, _ := dial(t, wsURL(srv.URL, path))
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"sub":1}`))
+	_ = readJSONFrame(t, conn, 2*time.Second) // subscribed
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"q":1}`))
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stuck turn 未启动")
+	}
+
+	_ = conn.Close()
+	waitForEvent(t, events, EventTurnStuck)
+	releaseTurn()
 }
 
 func TestDuplexOnMessageError(t *testing.T) {

@@ -1,6 +1,7 @@
 package wssession
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -24,6 +25,61 @@ func TestPushMarshalErrorReturned(t *testing.T) {
 	case <-s.outbox:
 		t.Fatal("序列化失败不应入队任何帧")
 	default:
+	}
+}
+
+func TestPushOutboundFrameTooLargeNotQueued(t *testing.T) {
+	t.Parallel()
+	s := &Session{
+		outbox: make(chan outboundMessage, 1),
+		options: Options{
+			QueueOfferTimeout:     time.Second,
+			MaxOutboundFrameBytes: len(`{"status":"ok"}`) - 1,
+		},
+	}
+
+	err := s.Push(t.Context(), map[string]any{"status": "ok"})
+	if !errors.Is(err, ErrOutboundFrameTooLarge) {
+		t.Fatalf("Push error = %v, want ErrOutboundFrameTooLarge", err)
+	}
+	select {
+	case <-s.outbox:
+		t.Fatal("超限帧不应入队")
+	default:
+	}
+}
+
+func TestPushOutboundFrameSizeEqualLimitQueued(t *testing.T) {
+	t.Parallel()
+	const payload = `{"status":"ok"}`
+	s := &Session{
+		outbox: make(chan outboundMessage, 1),
+		options: Options{
+			QueueOfferTimeout:     time.Second,
+			MaxOutboundFrameBytes: len(payload),
+		},
+	}
+
+	if err := s.Push(t.Context(), map[string]any{"status": "ok"}); err != nil {
+		t.Fatalf("Push error = %v", err)
+	}
+	if got := string((<-s.outbox).data); got != payload {
+		t.Fatalf("data = %s, want %s", got, payload)
+	}
+}
+
+func TestPushOutboundFrameDefaultUnlimited(t *testing.T) {
+	t.Parallel()
+	s := &Session{
+		outbox:  make(chan outboundMessage, 1),
+		options: Options{QueueOfferTimeout: time.Second},
+	}
+
+	if err := s.Push(t.Context(), map[string]any{"status": "ok"}); err != nil {
+		t.Fatalf("Push error = %v", err)
+	}
+	if len((<-s.outbox).data) == 0 {
+		t.Fatal("默认不限时应正常入队")
 	}
 }
 

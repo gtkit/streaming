@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	gtkitjson "github.com/gtkit/json"
+	gtkitjson "github.com/gtkit/json/v2"
 
 	"github.com/gorilla/websocket"
 )

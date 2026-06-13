@@ -6,8 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	gtkitjson "github.com/gtkit/json"
-
 	"github.com/gin-gonic/gin"
 )
 
@@ -92,11 +90,11 @@ func TestWriterData(t *testing.T) {
 	}
 }
 
-func TestWriterDataRawMessageSentinel(t *testing.T) {
+func TestWriterDataRawSentinel(t *testing.T) {
 	t.Parallel()
 	w, rec := newTestWriter(t)
 
-	if err := w.Data(gtkitjson.RawMessage("[DONE]")); err != nil {
+	if err := w.Data(Raw("[DONE]")); err != nil {
 		t.Fatalf("Data() error = %v", err)
 	}
 	if body := rec.Body.String(); body != "data: [DONE]\n\n" {
@@ -109,7 +107,7 @@ func TestWriterDataRawMultilineSplitsDataLines(t *testing.T) {
 	w, rec := newTestWriter(t)
 
 	// raw 透传含裸换行:按 SSE 规范拆成多个 data: 行,换行无法逃出 data 字段
-	if err := w.Data(gtkitjson.RawMessage("line1\nline2")); err != nil {
+	if err := w.Data(Raw("line1\nline2")); err != nil {
 		t.Fatalf("Data() error = %v", err)
 	}
 	if body := rec.Body.String(); body != "data: line1\ndata: line2\n\n" {
@@ -197,7 +195,7 @@ func TestStreamEventWithIDAndDataAutoStart(t *testing.T) {
 	if err := s.EventWithID("7", "chunk", map[string]int{"n": 1}); err != nil {
 		t.Fatalf("EventWithID() error = %v", err)
 	}
-	if err := s.Data(gtkitjson.RawMessage("[DONE]")); err != nil {
+	if err := s.Data(Raw("[DONE]")); err != nil {
 		t.Fatalf("Data() error = %v", err)
 	}
 

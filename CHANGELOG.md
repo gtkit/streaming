@@ -4,6 +4,31 @@
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [1.2.0] - 2026-06-13
+
+### Added
+
+- `sse` 新增 `Raw`，用于 `Data(sse.Raw("[DONE]"))` 这类 data-only 帧原样输出场景，不再依赖 JSON 包的 `RawMessage`
+- `wssession` 新增 `Options.MaxOutboundFrameBytes` 与 `ErrOutboundFrameTooLarge`，调用方可限制单条业务出站帧序列化后的最大字节数，超限帧不会进入出站队列
+- `wssession` 新增 `Options.TurnCloseTimeout` 与 `EventTurnStuck`，双向模式下旧 `OnMessage` 被取消后未及时退出时会上报事件并收敛连接
+
+### Changed
+
+- JSON 依赖迁移到 `github.com/gtkit/json/v2`，README 示例同步移除 `encoding/json`
+- README 明确区分 WebSocket 单向订阅模式与双向消息模式的客户端发帧约束，并补充 SSE 显式启动需要写入并 flush 首帧的说明
+
 ## [1.1.0] - 2026-06-10
 
 ### Added

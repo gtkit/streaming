@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	gtkitjson "github.com/gtkit/json"
+	gtkitjson "github.com/gtkit/json/v2"
 
 	"github.com/gin-gonic/gin"
 )
@@ -27,6 +27,16 @@ type Writer struct {
 }
 
 const defaultWriteTimeout = 10 * time.Second
+
+type rawData string
+
+// Raw 将 data 标记为 Writer.Data 或 Stream.Data 的已编码 SSE data payload。
+//
+// 仅在确实需要绕过 JSON 序列化的 data-only 帧中使用,例如 OpenAI 风格哨兵:
+// Data(sse.Raw("[DONE]"))。裸换行仍会被拆成多条 data 行,不能注入 event 或 id 字段。
+func Raw(data string) any {
+	return rawData(data)
+}
 
 // New 基于 gin.Context 创建一个 SSE Writer。
 func New(c *gin.Context) *Writer {
@@ -69,8 +79,8 @@ func (w *Writer) EventWithID(id, name string, payload any) error {
 }
 
 // Data 写入一条 data-only 帧（仅 `data:` 行，无事件名），即 OpenAI 风格的
-// 流式块格式；payload 自动 JSON 序列化，RawMessage 原样透传——
-// 终止哨兵可写作 Data(gtkitjson.RawMessage("[DONE]"))，输出字面 `data: [DONE]`。
+// 流式块格式；payload 自动 JSON 序列化，Raw(...) 原样透传——
+// 终止哨兵可写作 Data(sse.Raw("[DONE]"))，输出字面 `data: [DONE]`。
 // 前端经 EventSource 的 onmessage（默认事件）接收。
 func (w *Writer) Data(payload any) error {
 	return w.writeEvent("", "", payload)
@@ -92,11 +102,11 @@ func (w *Writer) writeEvent(id, name string, payload any) error {
 		return err
 	}
 
-	// RawMessage 绕过序列化原样透传(gtkitjson.Marshal 会校验 JSON 合法性,
+	// Raw 绕过序列化原样透传(gtkitjson.Marshal 会校验 JSON 合法性,
 	// 而 OpenAI 风格的 `[DONE]` 哨兵不是合法 JSON);其余 payload 正常序列化。
 	var data []byte
-	if raw, ok := payload.(gtkitjson.RawMessage); ok {
-		data = raw
+	if raw, ok := payload.(rawData); ok {
+		data = []byte(raw)
 	} else {
 		marshaled, err := gtkitjson.Marshal(payload)
 		if err != nil {

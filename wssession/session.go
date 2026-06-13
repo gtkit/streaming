@@ -291,6 +291,9 @@ func IsExpectedClose(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 		return true
 	}
+	if errors.Is(err, errTurnStuck) {
+		return true
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}

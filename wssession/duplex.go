@@ -23,7 +23,7 @@ type turn struct {
 //     OnMessage 在运行,被打断的旧轮不会在新轮启动后继续向 sink 推过期帧;
 //   - 入站限速:超额消息丢弃 + 上报 EventRateLimited,同一连续限速期只下发
 //     一帧 error(429) 提示,不关连接;
-//   - 收敛:ctx 取消时 cancel 活跃 turn 并 wg.Wait 等所有 turn 退出,杜绝 goroutine 泄漏。
+//   - 收敛:ctx 取消时 cancel 活跃 turn 并等待退出;失约 turn 超时后上报并收敛连接。
 //
 // 首帧已被 ParseRequest 当订阅/鉴权帧消费;duplexLoop 处理其后的每条消息。
 // 双向模式下 Run 可选:若提供,在后台 goroutine 并行运行(用于主动推送),
@@ -37,10 +37,14 @@ func (s *Session) duplexLoop(ctx context.Context, cancel context.CancelFunc, req
 	// 任一消息重新通过限速即复位——避免限速风暴下重复出帧。
 	limitedNotified := false
 
-	// 收敛:打断活跃 turn + 等所有 turn(含后台 Run)退出
+	// 收敛:打断活跃 turn + 等所有 turn(含后台 Run)退出。
 	defer func() {
 		if active != nil {
 			active.cancel()
+			if !s.waitTurnDone(ctx, active, "turn stuck during connection close") {
+				cancel()
+				return
+			}
 		}
 		wg.Wait()
 	}()
@@ -87,10 +91,10 @@ func (s *Session) duplexLoop(ctx context.Context, cancel context.CancelFunc, req
 				default:
 					active.cancel()
 					s.options.emit(ctx, Event{Type: EventTurnInterrupted, Reason: "interrupted by new message"})
-					select {
-					case <-active.done:
-					case <-ctx.Done():
-						return ctx.Err()
+					if !s.waitTurnDone(ctx, active, "turn stuck after interrupt") {
+						s.closeWithError(ctx, CodeInternal, ReasonInternalError)
+						cancel()
+						return errTurnStuck
 					}
 				}
 			}
@@ -136,6 +140,23 @@ func (s *Session) startTurn(ctx context.Context, cancel context.CancelFunc, wg *
 	})
 
 	return t
+}
+
+func (s *Session) waitTurnDone(ctx context.Context, active *turn, reason string) bool {
+	timer := time.NewTimer(s.options.TurnCloseTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-active.done:
+		return true
+	case <-timer.C:
+		ev := Event{Type: EventTurnStuck, Reason: reason}
+		if err := ctx.Err(); err != nil {
+			ev.Err = err
+		}
+		s.options.emit(ctx, ev)
+		return false
+	}
 }
 
 // offerRateLimitedFrame 向客户端**非阻塞**下发一帧 error(429) 限速提示,不关闭连接。

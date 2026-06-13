@@ -1,8 +1,8 @@
 # SSE Package
 
-`internal/pkg/sse` 提供项目内部统一的 SSE 输出工具。
+`github.com/gtkit/streaming/sse` 提供基于 gin 的 SSE 输出工具。
 
-它的目标不是做一个“覆盖所有 SSE 场景的超大框架”，而是解决当前项目里最常见的几个问题：
+它的目标不是做一个“覆盖所有 SSE 场景的超大框架”，而是解决实时/流式 HTTP 输出里最常见的几个问题：
 
 1. 统一写 `text/event-stream` 响应头
 2. 统一写 `event/data` 帧
@@ -10,27 +10,12 @@
 4. 统一暴露 `ping / error / retry / comment` 这些常见 SSE 辅助能力
 5. 让不同业务模块共享一套稳定的 SSE 写法
 
-当前项目里已经有两个真实使用场景：
-
-- `internal/module/llm/transport/http`
-- `internal/module/order/transport/http`
-
-对应接入文档：
-
-- [LLM STREAM_CHAT_SSE](../../module/llm/STREAM_CHAT_SSE.md)
-- [ORDER STATUS STREAM](../../module/order/ORDER_STATUS_STREAM.md)
-
-对应最小示例：
-
-- [examples/llm_sse_client/main.go](../../../examples/llm_sse_client/main.go)
-- [examples/order_status_sse_client/main.go](../../../examples/order_status_sse_client/main.go)
-
 ## 1. 和 `gin.Context.SSEvent()` 相比，这个包更好吗
 
 结论先说：
 
 - **不是绝对更好**
-- 但对当前这个项目来说，**更合适**
+- 但对需要可复用流式输出底座的项目来说，**更合适**
 
 ### 1.1 `c.SSEvent()` 的优点
 
@@ -48,9 +33,9 @@ Gin 自带的 `c.SSEvent()` 很直接：
 
 那直接用 `c.SSEvent()` 完全可以。
 
-### 1.2 当前这个包比 `c.SSEvent()` 更适合的原因
+### 1.2 这个包比 `c.SSEvent()` 更适合的原因
 
-当前项目的问题不是“能不能发 SSE”，而是：
+这类项目的问题不是“能不能发 SSE”，而是：
 
 - 多个模块都在发 SSE
 - 需要统一响应头
@@ -70,13 +55,13 @@ Gin 自带的 `c.SSEvent()` 很直接：
 3. 标准业务辅助方法  
    比如 `Ping()`、`Error()`、`Retry()`、`Comment()`。
 
-4. 项目内统一抽象  
+4. 统一抽象
    每个业务模块还是会写出各自不同风格的 SSE 代码。
 
-所以对这个项目来说，当前 `pkg/sse` 的价值在于：
+所以这个包的价值在于：
 
 - 不是简单包装 Gin
-- 而是提供一层“项目内部统一 SSE 语义”
+- 而是提供一层统一 SSE 语义
 
 ## 2. 包结构
 
@@ -135,13 +120,12 @@ import (
     "net/http"
     "time"
 
-    ssepkg "workai_status_api/internal/pkg/sse"
-
     "github.com/gin-gonic/gin"
+    "github.com/gtkit/streaming/sse"
 )
 
 func StreamDemo(c *gin.Context) {
-    stream := ssepkg.NewStream(c)
+    stream := sse.NewStream(c)
 
     // 首次 Event 会自动写 text/event-stream 头
     if err := stream.Event("status", gin.H{
@@ -229,7 +213,23 @@ data: {"error":"order not found"}
 - 这里是**服务端业务事件**
 - 不是浏览器 `EventSource.onerror` 那个网络层错误回调
 
-### 4.5 `stream.Comment(text)`
+### 4.5 `stream.Data(payload)`
+
+发送 data-only 帧（无 `event:` 行），适合 OpenAI 风格流式接口。
+
+普通 payload 会经 `github.com/gtkit/json/v2` 序列化：
+
+```go
+_ = stream.Data(gin.H{"delta": "hello"})
+```
+
+需要字面输出 `[DONE]` 这类非 JSON 哨兵时，用 `sse.Raw`：
+
+```go
+_ = stream.Data(sse.Raw("[DONE]"))
+```
+
+### 4.6 `stream.Comment(text)`
 
 发送一条 SSE 注释帧。
 
@@ -250,7 +250,7 @@ _ = stream.Comment("keepalive")
 - 调试
 - 某些代理环境下防止长时间空闲断开
 
-### 4.6 `stream.Retry(milliseconds)`
+### 4.7 `stream.Retry(milliseconds)`
 
 发送 SSE 的 `retry` 指令，提示客户端后续重连间隔。
 
@@ -269,7 +269,7 @@ retry: 3000
 
 - 给浏览器原生 `EventSource` 提供重连节奏建议
 
-### 4.7 `stream.Started()`
+### 4.8 `stream.Started()`
 
 判断当前响应是否已经开始输出。
 
@@ -290,13 +290,9 @@ if err != nil {
 }
 ```
 
-## 5. 当前项目里的两个真实模式
+## 5. 常见模式
 
 ### 5.1 LLM 流式输出
-
-文件：
-
-- [stream_responder.go](../../module/llm/transport/http/stream_responder.go)
 
 特点：
 
@@ -310,10 +306,6 @@ if err != nil {
 - 文本 token/delta 持续输出
 
 ### 5.2 订单状态流
-
-文件：
-
-- [handler.go](../../module/order/transport/http/handler.go)
 
 特点：
 
@@ -414,9 +406,9 @@ SSE 只适合：
 
 - `gin.Context.SSEvent()` 足够
 
-如果你要在这个项目里持续维护多个 SSE 业务流：
+如果你要持续维护多个 SSE 业务流：
 
-- 当前 `internal/pkg/sse` 更合适
+- `github.com/gtkit/streaming/sse` 更合适
 
 因为它已经把：
 

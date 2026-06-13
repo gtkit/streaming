@@ -159,6 +159,8 @@ func pollOrder(id string) (done bool, payload any, err error) {
 > **并发安全**：`Stream` 用互斥锁串行化所有写方法，可从不同 goroutine（如心跳 goroutine + 业务 goroutine）并发调用；底层 `Writer` **非并发安全**，多 goroutine 写同一连接请用 `Stream`。
 >
 > **写入硬化**：事件名 / id 含换行或 NUL 时返回错误（防 SSE 帧注入）；每帧 flush 失败（客户端已断开）当帧报错，不会对死连接持续推送。
+>
+> **显式启动**：`WriteHeaders` / `Stream.Start` 只设置响应头并解除长连接写截止；客户端要立即感知连接建立时，写一条注释或业务帧（如 `stream.Comment("open")`），该帧会 flush 到客户端。
 
 ### 断线续传（id + Last-Event-ID）
 
@@ -189,8 +191,10 @@ for chunk := range llmStream(ctx) {
 		return
 	}
 }
-_ = stream.Data(gtkitjson.RawMessage("[DONE]")) // data: [DONE]（RawMessage 原样透传）
+_ = stream.Data(sse.Raw("[DONE]")) // data: [DONE]（Raw 原样透传）
 ```
+
+`Data` 的普通 payload 会用 `github.com/gtkit/json/v2` 序列化；只有 `sse.Raw(...)` 会原样写入 data 行。
 
 ### POST + 请求体发起 SSE（如 LLM 流式响应）
 
@@ -327,11 +331,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	gtkitjson "github.com/gtkit/json/v2"
 	"github.com/gtkit/streaming/wssession"
 )
 
@@ -361,15 +365,16 @@ func handleWSMsg(c *gin.Context) {
 // wsOptions 集中配置：心跳 / 超时 / 连接 cap / Origin / 事件回调。
 func wsOptions() wssession.Options {
 	return wssession.Options{
-		AllowedOrigins:     []string{"https://example.com"}, // 空切片 = same-origin
-		MaxSessionDuration: 30 * time.Minute,
-		PingInterval:       25 * time.Second,
-		FirstFrameTimeout:  10 * time.Second,
-		ConnCapEnabled:     true,
-		ConnCapIPMax:       50, // 单 IP+path 并发上限
-		ConnCapKeyMax:      5,  // 单 key+path 并发上限（key 来自 ParseRequest）
-		TrustedProxyCount:  1,  // 部署在 1 层可信反代后；0（默认）则忽略 X-Forwarded-For，IP 取自 RemoteAddr
-		OnEvent:            onWSEvent,
+		AllowedOrigins:         []string{"https://example.com"}, // 空切片 = same-origin
+		MaxSessionDuration:     30 * time.Minute,
+		PingInterval:           25 * time.Second,
+		FirstFrameTimeout:      10 * time.Second,
+		ConnCapEnabled:         true,
+		ConnCapIPMax:           50,      // 单 IP+path 并发上限
+		ConnCapKeyMax:          5,       // 单 key+path 并发上限（key 来自 ParseRequest）
+		TrustedProxyCount:      1,       // 部署在 1 层可信反代后；0（默认）则忽略 X-Forwarded-For，IP 取自 RemoteAddr
+		MaxOutboundFrameBytes:  1 << 20, // 单条业务出站帧最大 1 MiB；0 表示不限
+		OnEvent:                onWSEvent,
 	}
 }
 
@@ -387,7 +392,7 @@ func wsHandlers() wssession.Handlers {
 // 必须快：只做解析 + 字段校验，不查 DB / 不发网络。
 func parseSubscribe(_ context.Context, raw []byte) (key string, req any, err error) {
 	var r subscribeReq
-	if err := json.Unmarshal(raw, &r); err != nil {
+	if err := gtkitjson.Unmarshal(raw, &r); err != nil {
 		return "", nil, err // → 下发 error(422) 帧并 close
 	}
 	if r.Token == "" {
@@ -409,7 +414,7 @@ func runPush(ctx context.Context, req any, sink wssession.PushSink) error {
 		case <-poll.C:
 			done, payload := pollOrder(r.Token)
 			if err := sink.Push(ctx, payload); err != nil {
-				return err // ErrSlowConsumer → 下发 error(429) + close
+				return err // ErrSlowConsumer / ErrOutboundFrameTooLarge 等
 			}
 			if done {
 				return nil // 正常结束 → normal closure
@@ -441,12 +446,12 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	gtkitjson "github.com/gtkit/json/v2"
 	"github.com/gtkit/streaming/wssession"
 )
 
@@ -480,7 +485,7 @@ func handleAuthedWS(c *gin.Context) {
 			// ParseRequest 必须快：只解析 + 提取 token，不查 DB / 不验签。
 			ParseRequest: func(_ context.Context, raw []byte) (key string, req any, err error) {
 				var f authFrame
-				if err := json.Unmarshal(raw, &f); err != nil {
+				if err := gtkitjson.Unmarshal(raw, &f); err != nil {
 					return "", nil, fmt.Errorf("bad auth frame: %w", err) // → error(422) + close
 				}
 				if f.Token == "" {
@@ -511,7 +516,7 @@ func handleAuthedWS(c *gin.Context) {
 					case <-poll.C:
 						done, payload := loadUserUpdates(r.userID)
 						if err := sink.Push(ctx, payload); err != nil {
-							return err // ErrSlowConsumer → error(429) + close
+							return err // ErrSlowConsumer / ErrOutboundFrameTooLarge 等
 						}
 						if done {
 							return nil
@@ -549,6 +554,8 @@ func loadUserUpdates(userID string) (done bool, payload any) {
 > 双向模式下 `OnMessage` **必须监听 `turnCtx` 并及时返回**（把它传给 LLM 流式调用），否则打断会阻塞后续消息的调度、连接关闭时会等待其退出——与 `ParseRequest`"必须快"同性质。
 
 入站限速（`InboundRatePerSecond`）触发时，被丢弃的每条消息都会上报 `EventRateLimited` 事件，但**同一连续限速期内只向客户端下发一帧 `error(429)` 提示**（限速恢复后再次超限会重新提示一帧）。双向模式下后台 `Run` 的错误处置与单向模式一致：`ErrSlowConsumer` → `error(429)` + close，其它错误 → `error(500)` + close。
+
+若旧 `OnMessage` 被打断后没有在 `TurnCloseTimeout`（默认 5s）内退出，`wssession` 会上报 `EventTurnStuck` 并收敛连接，避免该连接继续处理新消息；这不能强杀业务 goroutine，所以 `OnMessage` 仍必须监听 `ctx`。
 
 服务端：
 
@@ -673,6 +680,9 @@ IP 维度连接 cap 使用的客户端 IP 默认取自传输层 `RemoteAddr`，*
 | `EventSlowConsumer` | 出站队列满超时，客户端消费跟不上 | `Err` |
 | `EventCapRejected` | 连接被 IP / token cap 拒绝 | `Key`（cap key） |
 | `EventAbnormalClose` | 1006 异常断开（无正常 close 握手） | `Err` |
+| `EventRateLimited` | 双向模式入站消息超过速率限制 | `Reason` |
+| `EventTurnInterrupted` | 双向模式上一轮被新消息打断 | `Reason` |
+| `EventTurnStuck` | 双向模式上一轮取消后未及时退出 | `Reason` / `Err` |
 
 > `OnEvent` 必须**快且非阻塞**（同步参与连接收敛路径），与 `ParseRequest` 同约定。
 
@@ -783,6 +793,8 @@ for _, conn := range hub.Conns("user-1") {
   连接级状态经 `ParseRequest` 返回的 `req` 传递，或像本文示例一样在每次请求内现场构造 `Handlers`。
 - `Options.OnEvent` 回调会被多个 goroutine 并发调用，实现必须并发安全且快速非阻塞。
 - `sink.Push` 返回 `ErrSlowConsumer`（出站队列满 + 超时）时，业务应 `return` 让 `wssession` 收敛连接。
+- `sink.Push` 返回 `ErrOutboundFrameTooLarge` 时，该业务帧没有入队；生产环境建议按协议设置 `MaxOutboundFrameBytes`。
+- 双向模式的 `OnMessage` 必须监听 `ctx`；否则 `TurnCloseTimeout` 到期后会触发 `EventTurnStuck` 并关闭连接。
 
 ### 优雅停机
 
@@ -810,12 +822,14 @@ r.GET("/ws", func(c *gin.Context) {
 
 ### 前端对接（WebSocket）
 
+#### 单向订阅模式
+
 按 `wssession` 的协议约定对接，步骤：
 
 1. **建立连接**：`new WebSocket("wss://…/path")`，生产用 `wss`。浏览器原生 `WebSocket` 不能自定义 header——鉴权 token 走下一步的首帧（或 cookie）。
 2. **连上后立即发首帧订阅**（`onopen` 里），文本 JSON，字段与服务端 `ParseRequest` 解析的一致。
 3. **解析下行帧**（`onmessage`）：先 `JSON.parse`，按 `event` 分支——`subscribed`（订阅确认）/ `error`（带 `code` + `reason`）/ 其余为业务推送 payload。
-4. **首帧后不要再发业务帧**：协议约定"一连接一订阅"，订阅后再发任何帧会被服务端拒（`error` 422 + close）。
+4. **首帧后不要再发业务帧**：单向模式（`Handlers.OnMessage == nil`）协议约定"一连接一订阅"，订阅后再发任何帧会被服务端拒（`error` 422 + close）。
 5. **心跳无需处理**：服务端定期发 WebSocket Ping 控制帧，浏览器自动回 Pong；前端不用写心跳代码。长时间无数据时连接靠服务端 Ping 保活（`PongWait` 默认 70s）。
 6. **关闭与重连**：`onclose` 里区分正常关闭（code 1000）与异常，异常用指数退避重连，**重连后需重新发首帧订阅**。
 
@@ -853,4 +867,8 @@ function connect() {
 }
 ```
 
-> **不要**在订阅成功后用 `ws.send` 继续发业务请求帧——本包按"客户端首帧后只收不发"建模，多发会触发服务端 `error(422) + close`。需要双向交互、房间路由的场景见上文「适合什么项目 → 不适合的场景」。
+> **单向模式约束**：`Handlers.OnMessage == nil` 时，订阅成功后不要用 `ws.send` 继续发业务请求帧；多发会触发服务端 `error(422) + close`。
+
+#### 双向消息模式
+
+`Handlers.OnMessage != nil` 时，首帧仍是订阅 / 鉴权帧；收到 `subscribed` 后可以继续发送业务消息。每条业务消息触发一轮 `OnMessage`，新消息会打断上一轮。客户端应把 `error(429)` 当作限速提示；收到 `error(500)` 或 close 后按业务策略重连并重新发送首帧。

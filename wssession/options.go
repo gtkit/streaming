@@ -41,6 +41,8 @@ const (
 	EventRateLimited
 	// EventTurnInterrupted 双向模式下上一轮 OnMessage 因新消息到达被打断。
 	EventTurnInterrupted
+	// EventTurnStuck 双向模式下上一轮 OnMessage 被取消后未在超时内退出。
+	EventTurnStuck
 )
 
 // String 返回事件类型的可读名,便于日志。
@@ -58,6 +60,8 @@ func (t EventType) String() string {
 		return "rate_limited"
 	case EventTurnInterrupted:
 		return "turn_interrupted"
+	case EventTurnStuck:
+		return "turn_stuck"
 	default:
 		return "unknown"
 	}
@@ -107,6 +111,10 @@ type Options struct {
 	// OutboundBufferSize outbox channel 容量。默认 128。
 	OutboundBufferSize int
 
+	// MaxOutboundFrameBytes 单条业务出站文本帧序列化后的最大字节数。
+	// <=0(默认)=不限制。超限时 Push 返回 ErrOutboundFrameTooLarge,且不入队该帧。
+	MaxOutboundFrameBytes int
+
 	// QueueOfferTimeout 业务 sink.Push 入队超时;超时返回 ErrSlowConsumer。默认 5s。
 	QueueOfferTimeout time.Duration
 
@@ -144,9 +152,14 @@ type Options struct {
 	// <=0 时回退为 max(1, ceil(InboundRatePerSecond))。仅在限速启用时生效。
 	InboundRateBurst int
 
+	// TurnCloseTimeout 双向模式下打断旧 OnMessage 或连接收敛时等待旧 turn 退出的最长时间。
+	// 超时上报 EventTurnStuck 并收敛连接。默认 5s。
+	TurnCloseTimeout time.Duration
+
 	// OnEvent 可选的生命周期事件回调,用于接入调用方自己的日志 / metrics。
 	//
-	// 上报时机:panic / 慢消费者 / 连接 cap 拒绝 / 1006 异常断开(见 EventType)。
+	// 上报时机:panic / 慢消费者 / 连接 cap 拒绝 / 1006 异常断开 /
+	// 入站限速 / turn 打断 / turn 卡住(见 EventType)。
 	// nil 时桥接层跳过上报。本包不绑定日志栈,事件记录方式由调用方决定。
 	//
 	// 回调必须**快且非阻塞**(同步调用,会短暂参与连接收敛路径),且必须
@@ -206,6 +219,9 @@ func normalizeOptions(o Options) Options {
 	}
 	if o.QueueOfferTimeout <= 0 {
 		o.QueueOfferTimeout = 5 * time.Second
+	}
+	if o.TurnCloseTimeout <= 0 {
+		o.TurnCloseTimeout = 5 * time.Second
 	}
 	if o.InboundBufferSize <= 0 {
 		o.InboundBufferSize = 4

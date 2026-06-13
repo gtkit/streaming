@@ -14,7 +14,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	gtkitjson "github.com/gtkit/json"
+	gtkitjson "github.com/gtkit/json/v2"
 )
 
 // ============================================================================

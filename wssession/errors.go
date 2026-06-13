@@ -20,6 +20,10 @@ var (
 
 	// ErrHandlersIncomplete Handlers 缺必填字段(ParseRequest / Run 为 nil)。
 	ErrHandlersIncomplete = errors.New("wssession: handlers.ParseRequest and Run are required")
+
+	// ErrOutboundFrameTooLarge 出站 payload 序列化后超过 Options.MaxOutboundFrameBytes。
+	// Push 返回该错误时不会向 outbox 入队该帧。
+	ErrOutboundFrameTooLarge = errors.New("wssession: outbound frame too large")
 )
 
 // 错误码常量 — 与 docs/wsmsg-flow.md §5 错误码映射表对齐。
@@ -36,6 +40,8 @@ const (
 )
 
 const maxErrorReasonLen = 256
+
+var errTurnStuck = errors.New("wssession: turn stuck")
 
 // ReasonFirstFrameTimeout 等是下发给客户端 error 帧的标准 reason 文案（对外契约）。
 const (
